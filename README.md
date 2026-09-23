@@ -4,24 +4,24 @@
 
 ## 安装和运行
 
-Windows PowerShell 示例：
+在目标 Jetson（JetPack 6、Python 3.10）上安装并运行：
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-yolo.txt
-.\.venv\Scripts\python.exe track_video.py "E:\videos\sample.mp4" --weights models/detect.pt
+```bash
+export UV_PROJECT_ENVIRONMENT=.venv-jetson
+uv sync --python 3.10
+uv run --no-sync python track_video.py /path/to/sample.mp4 --weights models/detect.pt
 ```
 
-需要人工框选时安装带桌面 GUI 的 OpenCV 包。项目内的 `models/detect.pt` 是已有权重，运行不会重新训练。
+人工框选需要桌面图形会话。项目内的 `models/detect.pt` 是已有权重，运行不会重新训练。ONNX 导出与 TensorRT 构建需要额外依赖，安装方法见 [JETSON_PERFORMANCE.md](JETSON_PERFORMANCE.md#1-安装环境)。
 
 默认使用 CPU、1280 像素方形推理输入、0.25 置信度阈值和每帧检测。可用 `--imgsz 640` 减少计算量，但需检查小目标召回；`--device 0` 需要可用的 CUDA 环境。这些参数尚未经过独立评估集校准。
 
 不提供初始 ROI 时，首次检测到唯一候选才建立轨迹；无候选或有多个候选时保持 `WAITING`。场景中有其他同类物体时，可用 `--roi X Y W H` 指定首帧目标，或在播放窗口按 R 框选。ROI 使用原视频像素坐标。唯一检测也可能是误检，自动初始化不保证目标身份。
 
-```powershell
-.\.venv\Scripts\python.exe track_video.py "E:\videos\sample.mp4" --weights models/detect.pt --headless --roi 100 200 32 32 --output outputs\run_01
-.\.venv\Scripts\python.exe track_video.py "E:\videos\sample.mp4" --weights models/detect.pt --headless --start-frame 230 --max-frames 100 --output outputs\run_02
-.\.venv\Scripts\python.exe track_video.py "E:\videos\sample.mp4" --weights models/detect.pt --headless --detect-interval 3 --output outputs\run_03
+```bash
+uv run --no-sync python track_video.py /path/to/sample.mp4 --weights models/detect.pt --headless --roi 100 200 32 32 --output outputs/run_01
+uv run --no-sync python track_video.py /path/to/sample.mp4 --weights models/detect.pt --headless --start-frame 230 --max-frames 100 --output outputs/run_02
+uv run --no-sync python track_video.py /path/to/sample.mp4 --weights models/detect.pt --headless --detect-interval 3 --output outputs/run_03
 ```
 
 GUI 初始暂停：Space 播放或暂停，N 单步，R 在当前帧重建轨迹段，Q 或 Esc 保存并退出。窗口默认按比例缩至 960×540 以内，`--window-size 800 450` 可调整预览上限；框选坐标会换算回原视频坐标。目标较晚出现时可用零起始的 `--start-frame`。输出目录必须不存在；未指定时创建带时间戳的新目录，输入视频始终只读。
@@ -54,8 +54,8 @@ GUI 初始暂停：Space 播放或暂停，N 单步，R 在当前帧重建轨迹
 
 ## 验证
 
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```bash
+uv run --no-sync python -m unittest discover -s tests -v
 ```
 
 测试覆盖滤波、单目标匹配、丢失与人工重建、计时及读写流程。合成测试只验证软件流程，不代表真实录像精度；交互窗口需要人工验收。

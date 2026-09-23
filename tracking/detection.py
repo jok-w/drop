@@ -23,7 +23,7 @@ class YoloDetector:
             import ultralytics
             from ultralytics import YOLO
         except ImportError as exc:
-            raise RuntimeError("Install requirements-yolo.txt to use --weights") from exc
+            raise RuntimeError("Install project dependencies with 'uv sync --python 3.10' to use --weights") from exc
         if image_size < 32 or image_size % 32:
             raise ValueError("imgsz must be a positive multiple of 32")
         from .model_artifacts import (read_engine_metadata, read_onnx_metadata, validate_source,

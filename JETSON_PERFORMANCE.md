@@ -5,14 +5,14 @@
 
 ## 1. 安装环境
 
-当前 Windows 的 `.venv` 保持原状；下面在 **目标 Jetson** 的项目目录运行，使用独立 `.venv-jetson`：
+下面在 **目标 Jetson** 的项目目录运行，使用 `.venv-jetson`：
 
 ```bash
 export UV_PROJECT_ENVIRONMENT=.venv-jetson
 uv sync --python 3.10 --extra export
 ```
 
-`pyproject.toml` 参考 detect_test 的安装源：Jetson torch 2.8.0 / torchvision 0.23.0 使用 jp6/cu126 wheel，Ultralytics 固定 8.4.158，NumPy 1.x。使用 opencv-python 4.11，并避免与其他 OpenCV 包混装。
+`pyproject.toml` 是项目 Python 包的唯一依赖声明：Jetson torch 2.8.0 / torchvision 0.23.0 使用 jp6/cu126 wheel，Ultralytics 固定 8.4.158，NumPy 1.x。使用 opencv-python 4.11，并避免与其他 OpenCV 包混装。普通追踪只需 `uv sync --python 3.10`；本节使用 `--extra export` 安装 ONNX 导出与验证依赖。
 TensorRT 与 GI 来自设备配套系统库，不从通用 PyPI 安装 TensorRT。先检查系统解释器：
 
 ```bash
@@ -160,7 +160,7 @@ uv run --no-sync python -m unittest discover -s tests -v
 RUN_JETSON_GSTREAMER_TEST=1 uv run --no-sync python -m unittest discover -s tests -p 'test_video_*.py' -v
 ```
 
-硬件集成测试覆盖真实 NVENC/NVDEC、非均匀 PTS、帧序和提前结束；Windows 会跳过它们。
+硬件集成测试覆盖真实 NVENC/NVDEC、非均匀 PTS、帧序和提前结束；需要在目标 Jetson 上运行。
 本地已完成 ONNX 构建及 PT/ONNX 16 帧真实输入比较，接受的整像素框完全一致；这不是跨视频精度评估。
 本地没有 CUDA/TensorRT，尚未生成目标 Jetson 的 engine，也尚未验证 Jetson 硬件性能。
 

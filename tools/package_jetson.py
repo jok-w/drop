@@ -9,7 +9,7 @@ import zipfile
 def main():
     root = Path(__file__).resolve().parents[1]
     files = [root / name for name in ["track_video.py", "README.md", "JETSON_PERFORMANCE.md", "PERFORMANCE_VALIDATION.md",
-             "pyproject.toml", "requirements.txt", "requirements-yolo.txt", "requirements-export.txt",
+             "pyproject.toml",
              "models/detect.pt", "models/detect.onnx"]]
     for directory in ("tracking", "tests", "tools"):
         files.extend(sorted((root / directory).glob("*.py")))
