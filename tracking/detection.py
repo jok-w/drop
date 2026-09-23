@@ -119,7 +119,6 @@ class DetectionTracker:
         self.class_id = None
         self.last_detection_index = None
         self.last_time = None
-        self.lost = False
         self.velocity_ready = False
 
     def _record(self, timestamp, frame_index, timestamp_source):
@@ -137,22 +136,6 @@ class DetectionTracker:
                       seconds_since_observation=None)
         return result
 
-    def initialize(self, frame, box, timestamp, frame_index, timestamp_source):
-        box = validate_box(box, frame.shape)
-        self.motion = MotionFilter(center_of(box), self.config)
-        self.last_box = box
-        self.last_time = self.last_visible_time = timestamp
-        self.last_detection_index = None
-        self.class_id = None
-        self.lost = False
-        self.velocity_ready = False
-        self.segment += 1
-        result = self._result(timestamp, frame_index, timestamp_source)
-        result.update(state="TRACKING", source="manual", reason="initialized", bbox=list(box),
-                      center=list(center_of(box)), estimated_center=list(center_of(box)),
-                      seconds_since_observation=0.)
-        return result
-
     def update(self, frame, timestamp, frame_index, timestamp_source):
         if self.last_time is not None and timestamp <= self.last_time:
             raise ValueError("Frame timestamps must increase")
@@ -160,10 +143,13 @@ class DetectionTracker:
         if self.motion is not None:
             gap = timestamp - self.last_visible_time
             result["seconds_since_observation"] = gap
-            if self.lost or gap > self.config.coast_seconds:
-                self.lost = True
+            if gap > self.config.coast_seconds:
+                self.motion = None
+                self.velocity_ready = False
+                self.last_detection_index = None
+                self.last_visible_time = None
                 self.last_time = timestamp
-                result.update(state="LOST", reason="awaiting_manual_reinitialization")
+                result.update(state="LOST", reason="tracking_timeout")
                 return result
             prediction = self.motion.predict(timestamp-self.last_time)
             result.update(predicted_center=prediction.tolist(), estimated_center=prediction.tolist(),
@@ -210,22 +196,27 @@ class DetectionTracker:
             self.motion = MotionFilter(center, self.config)
             self.segment += 1
         elif not self.velocity_ready:
-            # Two observations initialize velocity. A zero-velocity prior cannot
-            # establish a valid motion gate for an already-moving object.
+            # Infer velocity at the second observation under the same drag model.
+            # A zero-velocity prior cannot gate an already-moving object.
             dt = timestamp - self.last_visible_time
-            velocity = (np.asarray(center)-center_of(self.last_box)) / dt
+            rate = self.config.deceleration_rate
+            decay = math.exp(-rate * dt)
+            travel = -math.expm1(-rate * dt) / rate
+            velocity_scale = decay / travel
+            velocity = (np.asarray(center)-center_of(self.last_box)) * velocity_scale
             self.motion = MotionFilter(center, self.config)
             self.motion.x[2:] = velocity
             variance = self.config.measurement_std**2
-            self.motion.P = np.block([[np.eye(2)*variance, np.eye(2)*variance/dt],
-                                      [np.eye(2)*variance/dt, np.eye(2)*2*variance/dt**2]])
+            self.motion.P = np.block([[np.eye(2)*variance, np.eye(2)*variance*velocity_scale],
+                                      [np.eye(2)*variance*velocity_scale,
+                                       np.eye(2)*2*variance*velocity_scale**2]])
             self.velocity_ready = True
         else:
             self.motion.correct(center)
         self.class_id = detection["class_id"]
         self.last_visible_time = timestamp
         self.last_box = box
-        reason = "detected_initialization" if first else (
+        reason = ("detected_initialization" if self.segment == 1 else "detected_reinitialization") if first else (
             "detected_motion_disagreement" if d2 is not None and d2 > self.config.gate else "detected")
         result.update(state="TRACKING", source="yolo", reason=reason,
                       segment=self.segment, bbox=list(box), center=list(center), candidate_bbox=list(box),

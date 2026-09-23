@@ -1,4 +1,5 @@
 import unittest
+import math
 
 import numpy as np
 
@@ -39,7 +40,9 @@ class DetectionTests(unittest.TestCase):
         row = tracker.update(self.frame, .12, 3, "test")
         self.assertEqual(row["center"], [56, 90])
         self.assertEqual(detector.calls, 2)
-        np.testing.assert_allclose(tracker.motion.x[2:], [50, 0])
+        rate = tracker.config.deceleration_rate
+        expected = 6 * math.exp(-rate * .12) * rate / (1 - math.exp(-rate * .12))
+        np.testing.assert_allclose(tracker.motion.x[2:], [expected, 0])
 
     def test_ambiguous_start_waits_for_unique_detection(self):
         tracker = DetectionTracker(FakeDetector([[detection(), detection(80)], [detection()]]))
@@ -65,8 +68,9 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(result["reason"], "association_rejected")
         self.assertIsNone(result["center"])
 
-    def test_missing_recovers_then_times_out_without_identity_switch(self):
-        detector = FakeDetector([[detection()], [], [detection(42)]])
+    def test_missing_recovers_then_reinitializes_after_timeout(self):
+        detector = FakeDetector([[detection()], [], [detection(42)],
+                                 [detection(class_id=1), detection(80)], [detection(82)]])
         tracker = DetectionTracker(detector, Config(coast_seconds=.2))
         tracker.update(self.frame, 0., 0, "test")
         self.assertEqual(tracker.update(self.frame, .04, 1, "test")["state"], "LOST_PENDING")
@@ -75,17 +79,13 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(result["state"], "LOST")
         self.assertIsNone(result["estimated_center"])
         self.assertEqual(detector.calls, 3)
-        result = tracker.initialize(self.frame, [40, 80, 20, 20], .3, 3, "test")
+        result = tracker.update(self.frame, .34, 4, "test")
         self.assertEqual(result["segment"], 2)
-        self.assertFalse(tracker.lost)
-
-    def test_manual_seed_runs_detector_on_next_frame(self):
-        detector = FakeDetector([[detection(42)]])
-        tracker = DetectionTracker(detector, interval=5)
-        tracker.initialize(self.frame, [40, 80, 20, 20], 0., 50, "test")
-        result = tracker.update(self.frame, .04, 51, "test")
+        self.assertEqual(result["reason"], "detected_reinitialization")
+        self.assertEqual(result["center"], [90, 90])
         self.assertTrue(result["detection_ran"])
-        self.assertEqual(result["source"], "yolo")
+        self.assertEqual(tracker.class_id, 0)
+        self.assertEqual(tracker.update(self.frame, .38, 5, "test")["segment"], 2)
 
     def test_bad_interval_and_timestamp_fail(self):
         with self.assertRaises(ValueError):
@@ -100,7 +100,10 @@ class DetectionTests(unittest.TestCase):
         tracker.update(self.frame, 0., 0, "test")
         result = tracker.update(self.frame, .04, 1, "test")
         self.assertEqual(result["state"], "TRACKING")
-        np.testing.assert_allclose(tracker.motion.x[2:], [1500, 0])
+        dt = .04
+        rate = tracker.config.deceleration_rate
+        expected = 60 * math.exp(-rate * dt) * rate / (1 - math.exp(-rate * dt))
+        np.testing.assert_allclose(tracker.motion.x[2:], [expected, 0])
         self.assertGreaterEqual(np.linalg.eigvalsh(tracker.motion.P).min(), 0)
         self.assertEqual(tracker.update(self.frame, .08, 2, "test")["state"], "TRACKING")
 

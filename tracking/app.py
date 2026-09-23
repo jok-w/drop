@@ -10,10 +10,10 @@ import time
 import cv2
 import numpy as np
 
-from .core import Config, validate_box
+from .core import Config
 
 
-WINDOW = "Single target | SPACE play/pause | N next | R reselect | Q quit"
+WINDOW = "Single target | SPACE play/pause | N next | Q quit"
 FIELDS = ["frame_index", "timestamp", "timestamp_source", "segment", "state", "source",
           "reason", "x", "y", "width", "height", "center_x", "center_y",
           "predicted_x", "predicted_y", "mahalanobis_squared", "candidate_bbox"]
@@ -99,25 +99,6 @@ def draw_output(frame, result, history, estimated_history, size):
                 [(point(p), segment) for p, segment in estimated_history])
 
 
-def select_box(frame, bounds=(960, 540)):
-    name = "Select target | ENTER confirm | C cancel"
-    size = display_size(frame, bounds)
-    preview = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
-    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(name, *size)
-    try:
-        x, y, w, h = cv2.selectROI(name, preview, showCrosshair=True, fromCenter=False)
-    finally:
-        cv2.destroyWindow(name)
-    if w <= 0 or h <= 0:
-        return None
-    # Map preview edges back to source pixels, including rounding at the borders.
-    sx, sy = frame.shape[1] / size[0], frame.shape[0] / size[1]
-    x1, y1 = round(x * sx), round(y * sy)
-    x2, y2 = round((x + w) * sx), round((y + h) * sy)
-    return x1, y1, x2 - x1, y2 - y1
-
-
 def csv_row(result):
     row = {key: result.get(key) for key in FIELDS}
     for key, value in zip(["x", "y", "width", "height"], result["bbox"] or [None] * 4):
@@ -140,6 +121,7 @@ def config_for_frame(args, shape):
         gate=args.gate,
         measurement_std=args.measurement_std if args.measurement_std is not None else 4.0 * scale,
         acceleration_std=args.acceleration_std if args.acceleration_std is not None else 800.0 * scale,
+        deceleration_rate=args.deceleration_rate,
         initial_velocity_std=args.initial_velocity_std if args.initial_velocity_std is not None else 200.0 * scale,
         coast_seconds=args.coast_seconds,
     )
@@ -162,8 +144,8 @@ def run(args):
             or (args.log_every is not None and args.log_every < 0)):
         raise ValueError("Invalid window size, output width, warmup or log interval")
     if args.mode == "detect-benchmark" and (not args.headless or not args.no_video
-                                            or args.roi is not None or args.detect_interval != 1):
-        raise ValueError("detect-benchmark requires --headless --no-video, interval=1 and no ROI")
+                                            or args.detect_interval != 1):
+        raise ValueError("detect-benchmark requires --headless --no-video and interval=1")
     video = Path(args.video).resolve()
     if not video.is_file():
         raise ValueError(f"Video does not exist: {video}")
@@ -197,9 +179,6 @@ def run(args):
                 raise ValueError("No readable frame at start-frame")
         height, width = frame.shape[:2]
         config = config_for_frame(args, frame.shape)
-        box = args.roi
-        if box is not None:
-            box = validate_box(box, frame.shape)
         if args.detect_interval / fps > config.coast_seconds:
             raise ValueError("Detection interval exceeds coast-seconds")
         with perf.section("warmup_ms"):
@@ -223,7 +202,7 @@ def run(args):
         paused = True
         history, estimated_history = deque(maxlen=250), deque(maxlen=250)
         counts, reasons = Counter(), Counter()
-        interventions = fallbacks = count = detector_calls = 0
+        fallbacks = count = detector_calls = 0
         end_reason = "end_of_readable_video"
         if not args.headless:
             cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
@@ -261,8 +240,6 @@ def run(args):
                     result = tracker._result(stamp, index, stamp_source)
                     result.update(state="BENCHMARK", source="yolo", reason="benchmark_detection",
                                   detection_ran=True, detections=detections)
-                elif count == 0 and box is not None:
-                    result = tracker.initialize(frame, box, stamp, index, stamp_source)
                 else:
                     result = tracker.update(frame, stamp, index, stamp_source)
                 processing_ms = (time.perf_counter()-processing_started)*1000
@@ -283,14 +260,6 @@ def run(args):
                         if key in (ord("q"), 27) or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                             quit_requested = True
                             break
-                        if key == ord("r"):
-                            new_box = select_box(frame, args.window_size)
-                            if new_box is not None:
-                                result = tracker.initialize(frame, new_box, stamp, index, stamp_source)
-                                interventions += 1
-                                canvas = draw_output(frame, result, history, estimated_history, output_size)
-                            paused = True
-                            continue
                         if key == ord(" "):
                             paused = not paused
                         if key == ord("n"):
@@ -353,9 +322,9 @@ def run(args):
         summary = dict(input=str(video), output=str(output), fps=fps, width=width, height=height,
                        frames=count, start_frame=args.start_frame, end_frame=index,
                        end_reason=end_reason, states=dict(counts), reasons=dict(reasons),
-                       manual_reinitializations=interventions, timestamp_fallbacks=fallbacks,
+                       timestamp_fallbacks=fallbacks,
                        wall_seconds=elapsed, throughput_fps=count/max(elapsed, 1e-9),
-                       config=vars(config), initial_roi=list(box) if box else None, opencv=cv2.__version__,
+                       config=vars(config), opencv=cv2.__version__,
                        backend=detector.metadata['backend'],
                        detector=detector.metadata,
                        detect_interval=args.detect_interval,
@@ -366,7 +335,7 @@ def run(args):
         (output / "performance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"视频处理完成：处理帧数={count}，模型检测帧数={report['detection_calls']}，"
               f"纯预测帧数={counts['PREDICTED']}，无观测帧数={count-counts['TRACKING']}，"
-              f"人工重新初始化次数={interventions}，结束原因={end_reason}，输出={output}", flush=True)
+              f"结束原因={end_reason}，输出={output}", flush=True)
         for name in ("read_wait_ms", "detector_ms", "inference_ms", "tracking_ms", "draw_ms", "data_write_ms", "video_submit_ms"):
             value = report["stages"][name]
             if value['count']:
@@ -391,7 +360,6 @@ def run(args):
 def parser():
     p = argparse.ArgumentParser(description="Offline YOLO + Kalman single-target tracking")
     p.add_argument("video", help="Input video path")
-    p.add_argument("--roi", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
     p.add_argument("--headless", action="store_true", help="No windows")
     p.add_argument("--weights", required=True, help="Local YOLO .pt weights")
     p.add_argument("--backend", choices=("pt", "onnx", "tensorrt"), default="pt")
@@ -424,6 +392,8 @@ def parser():
     p.add_argument("--gate", type=float, default=5.991, help="Squared Mahalanobis threshold")
     p.add_argument("--measurement-std", type=float, help="Image measurement std in pixels (default: resolution-scaled)")
     p.add_argument("--acceleration-std", type=float, help="Motion noise std in px/s^2 (default: resolution-scaled)")
+    p.add_argument("--deceleration-rate", type=float, default=2.0,
+                   help="Velocity decay rate in 1/s (default: 2.0)")
     p.add_argument("--initial-velocity-std", type=float, help="Initial velocity uncertainty in px/s (default: resolution-scaled)")
     p.add_argument("--coast-seconds", type=float, default=0.5, help="Max duration of displayed predictions")
     p.add_argument("--fallback-fps", type=float, help="Used only if video FPS is unavailable")

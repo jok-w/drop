@@ -1,4 +1,5 @@
 import unittest
+import math
 
 import numpy as np
 
@@ -26,15 +27,23 @@ class MotionTests(unittest.TestCase):
         self.assertAlmostEqual(kf.distance_squared((120, 205)), 5)
         self.assertAlmostEqual(kf.distance_squared((105, 220)), 16.25)
 
-    def test_constant_velocity_with_irregular_timestamps(self):
-        kf = MotionFilter((0, 0), Config())
-        time = 0
+    def test_prediction_decelerates_without_reversing(self):
+        rate = 2.0
+        kf = MotionFilter((0, 0), Config(deceleration_rate=rate))
+        kf.x[2:] = [100, -50]
+        elapsed = 0.
         for dt in [.04, .08, .12, .04] * 10:
-            time += dt
+            elapsed += dt
             kf.predict(dt)
-            kf.correct((50 * time, 20 * time))
-        np.testing.assert_allclose(kf.x, [50 * time, 20 * time, 50, 20], atol=.1)
+            decay = math.exp(-rate * elapsed)
+            travel = (1 - decay) / rate
+            np.testing.assert_allclose(kf.x, [100 * travel, -50 * travel,
+                                              100 * decay, -50 * decay], atol=1e-10)
         self.assertGreaterEqual(np.linalg.eigvalsh(kf.P).min(), -1e-9)
+
+    def test_deceleration_rate_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            Config(deceleration_rate=0)
 
     def test_timestamp_fallback_is_monotonic(self):
         clock = VideoClock(25)

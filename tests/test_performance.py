@@ -79,19 +79,25 @@ class PerformanceTests(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows[1]["inference_ms"], "")
 
-    def test_manual_roi_still_initializes_yolo_tracking(self):
+    def test_tracking_starts_with_detection_and_has_no_manual_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             video = self.make_video(root)
-            args = parser().parse_args([str(video), "--weights", "unused.pt", "--roi", "20", "30", "20", "20",
+            args = parser().parse_args([str(video), "--weights", "unused.pt",
                                         "--headless", "--no-video", "--output", str(root/"out")])
             with patch("tracking.detection.YoloDetector", FakeDetector):
                 output = run(args)
             rows = [json.loads(line) for line in (output/"track.jsonl").read_text().splitlines()]
-            self.assertEqual(rows[0]["source"], "manual")
-            self.assertEqual(rows[0]["center"], [30, 40])
+            self.assertEqual(rows[0]["state"], "WAITING")
+            self.assertTrue(rows[0]["detection_ran"])
             self.assertTrue(rows[1]["detection_ran"])
-            self.assertEqual(rows[1]["state"], "LOST_PENDING")
+            summary = json.loads((output/"summary.json").read_text())
+            self.assertNotIn("initial_roi", summary)
+            self.assertNotIn("manual_reinitializations", summary)
+
+    def test_roi_option_is_removed(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser().parse_args(["input.mp4", "--weights", "unused.pt", "--roi", "1", "2", "3", "4"])
 
     def test_progress_reports_processed_frames_each_video_second(self):
         with tempfile.TemporaryDirectory() as tmp:
