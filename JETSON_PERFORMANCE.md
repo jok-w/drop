@@ -12,7 +12,7 @@ export UV_PROJECT_ENVIRONMENT=.venv-jetson
 uv sync --python 3.10 --extra export
 ```
 
-`pyproject.toml` 参考 detect_test 的安装源：Jetson torch 2.8.0 / torchvision 0.23.0 使用 jp6/cu126 wheel，Ultralytics 固定 8.4.158，NumPy 1.x。排除 opencv-python，使用 opencv-contrib-python 4.11 保留 CSRT，避免两个 OpenCV 包互相覆盖。
+`pyproject.toml` 参考 detect_test 的安装源：Jetson torch 2.8.0 / torchvision 0.23.0 使用 jp6/cu126 wheel，Ultralytics 固定 8.4.158，NumPy 1.x。使用 opencv-python 4.11，并避免与其他 OpenCV 包混装。
 TensorRT 与 GI 来自设备配套系统库，不从通用 PyPI 安装 TensorRT。先检查系统解释器：
 
 ```bash
@@ -85,7 +85,7 @@ uv run --no-sync python track_video.py camera_20260910_144729.mp4 \
 | postprocess_ms | Ultralytics 后处理，包括 NMS |
 | result_transfer_ms | 检测结果转 CPU、列表与坐标校验 |
 | detector_overhead_ms | 模型调用总时间中其他框架开销 |
-| tracking_ms | 检测之外的关联、Kalman 与记录准备；旧 CSRT 模式中包含旧跟踪后端 |
+| tracking_ms | 检测之外的关联、Kalman 与记录准备 |
 | draw_ms | 输出缩放、绘框与轨迹 |
 | display_ms | GUI 等待及人工操作；headless 为 0 |
 | data_write_ms | track.csv / track.jsonl 序列化与缓冲写入 |

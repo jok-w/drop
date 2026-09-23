@@ -5,7 +5,7 @@ description = "Single inert-object tracking and Jetson performance experiments"
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "numpy>=1.24,<2",
-    "opencv-contrib-python==4.11.0.86",
+    "opencv-python==4.11.0.86",
     "torch==2.8.0",
     "torchvision==0.23.0",
     "ultralytics==8.4.158",
@@ -15,7 +15,7 @@ dependencies = [
 export = ["onnx>=1.17,<1.18", "onnxruntime>=1.20,<1.23", "onnxslim>=0.1.82,<0.2"]
 
 [tool.uv]
-exclude-dependencies = ["tensorrt", "opencv-python"]
+exclude-dependencies = ["tensorrt"]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
     "sys_platform == 'win32' and platform_machine == 'AMD64'",

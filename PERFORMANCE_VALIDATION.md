@@ -6,14 +6,14 @@
 - 独立 detect-benchmark 每帧推理，避免轨迹丢失后停推理导致平均 FPS 虚高。
 - TensorRT 10 构建与元数据校验代码，静态 batch=1、FP16 层优化、默认 1280 输入。
 - 从参考项目迁移 Jetson 硬件读写、PTS、有限预读、错误传播和收尾。
-- 保留 CSRT；无窗口且无视频保存时不绘图。
+- 无窗口且无视频保存时不绘图。
 - 提供 Jetson 环境配置、预检查、构建说明和独立进程对照脚本。
 
 ## 实际执行结果
 
 本机：Windows 11、Python 3.13.12、torch 2.14.0+cpu、Ultralytics 8.4.158，CUDA 不可用。
 
-1. `python -m unittest discover -s tests`：58 项，55 项通过，3 项 Jetson 硬件集成测试跳过。
+1. `python -m unittest discover -s tests`：当前 54 项，51 项通过，3 项 Jetson 硬件集成测试跳过。
 2. 从提供的 PT 构建 `models/detect.onnx` 成功，ONNX 图检查与 CPU 输入验证通过；IR=8、opset=17，动态输入 NCHW。
 3. 权重架构确认是 YOLO26n；修正 nms=False 会切换检测头的问题，统一 nms=None 外部 NMS。
 4. 第 230～245 帧 PT/ONNX 比较：16 帧全部各匹配一个检测框，整像素框平均 IoU=1.0、中心差异=0、未匹配数量=0。这仅验证该片段的后端一致性。

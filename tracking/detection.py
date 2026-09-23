@@ -5,7 +5,7 @@ import time
 
 import numpy as np
 
-from .core import Config, MotionFilter, SingleTargetTracker, center_of, validate_box
+from .core import Config, MotionFilter, center_of, validate_box
 
 
 class YoloDetector:
@@ -109,9 +109,6 @@ class YoloDetector:
 
 
 class DetectionTracker:
-    # Keep the existing export contract, without inheriting CSRT update behavior.
-    _record = SingleTargetTracker._record
-
     def __init__(self, detector, config=None, interval=1, strict_motion_gate=False):
         if not isinstance(interval, int) or interval < 1:
             raise ValueError("detect-interval must be a positive integer")
@@ -119,12 +116,19 @@ class DetectionTracker:
         self.strict_motion_gate = strict_motion_gate
         self.motion = None
         self.segment = 0
-        self.appearance = None
         self.class_id = None
         self.last_detection_index = None
         self.last_time = None
         self.lost = False
         self.velocity_ready = False
+
+    def _record(self, timestamp, frame_index, timestamp_source):
+        return dict(frame_index=frame_index, timestamp=timestamp,
+                    timestamp_source=timestamp_source, segment=self.segment,
+                    state="LOST_PENDING", source="none", reason="",
+                    bbox=None, center=None, candidate_bbox=None,
+                    predicted_center=None, innovation_covariance=None,
+                    mahalanobis_squared=None)
 
     def _result(self, timestamp, index, source):
         result = self._record(timestamp, index, source)

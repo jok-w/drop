@@ -10,14 +10,13 @@ import time
 import cv2
 import numpy as np
 
-from .core import Config, SingleTargetTracker, create_csrt, validate_box
+from .core import Config, validate_box
 
 
 WINDOW = "Single target | SPACE play/pause | N next | R reselect | Q quit"
 FIELDS = ["frame_index", "timestamp", "timestamp_source", "segment", "state", "source",
           "reason", "x", "y", "width", "height", "center_x", "center_y",
-          "predicted_x", "predicted_y", "mahalanobis_squared", "candidate_bbox",
-          "appearance_reason", "appearance_cost", "appearance_candidates"]
+          "predicted_x", "predicted_y", "mahalanobis_squared", "candidate_bbox"]
 FIELDS += ["estimated_x", "estimated_y", "detection_ran", "detection_confidence",
            "class_id", "seconds_since_observation"]
 
@@ -64,8 +63,6 @@ def draw(frame, result, history, estimated_history=()):
              "Green: image | Orange: prediction"]
     if result["mahalanobis_squared"] is not None:
         lines.append(f"Motion d^2 = {result['mahalanobis_squared']:.2f}")
-    if result.get("appearance_cost") is not None:
-        lines.append(f"Appearance cost = {result['appearance_cost']:.2f}")
     if result.get("estimated_center") is not None:
         ex, ey = result["estimated_center"]
         if -10000 < ex < 10000 and -10000 < ey < 10000:
@@ -155,35 +152,30 @@ def run(args):
     perf = Performance()
     if args.start_frame < 0 or (args.max_frames is not None and args.max_frames <= 0):
         raise ValueError("start-frame must be >= 0 and max-frames must be > 0")
-    if args.headless and args.roi is None and args.weights is None:
-        raise ValueError("--headless requires --roi or --weights")
-    if args.backend != "pt" and not args.weights:
-        raise ValueError("Exported backends require original --weights for fingerprint validation")
+    if not args.weights:
+        raise ValueError("--weights is required for YOLO tracking")
     if args.engine and args.backend != "tensorrt":
         raise ValueError("--engine requires --backend tensorrt")
     if args.onnx and args.backend != "onnx":
         raise ValueError("--onnx requires --backend onnx")
-    if min(args.window_size) <= 0 or args.output_max_width < 0 or args.warmup < 0 or args.log_every < 0:
+    if (min(args.window_size) <= 0 or args.output_max_width < 0 or args.warmup < 0
+            or (args.log_every is not None and args.log_every < 0)):
         raise ValueError("Invalid window size, output width, warmup or log interval")
-    if args.mode == "detect-benchmark" and (not args.weights or not args.headless or not args.no_video
+    if args.mode == "detect-benchmark" and (not args.headless or not args.no_video
                                             or args.roi is not None or args.detect_interval != 1):
-        raise ValueError("detect-benchmark requires --weights --headless --no-video, interval=1 and no ROI")
+        raise ValueError("detect-benchmark requires --headless --no-video, interval=1 and no ROI")
     video = Path(args.video).resolve()
     if not video.is_file():
         raise ValueError(f"Video does not exist: {video}")
     output = Path(args.output or (Path("outputs") / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f"))).resolve()
     if output.exists():
         raise FileExistsError(f"Output already exists: {output}")
-    detector = None
+    from .detection import YoloDetector, DetectionTracker
+    if args.detect_interval < 1:
+        raise ValueError("detect-interval must be positive")
     with perf.section("model_load_ms"):
-        if args.weights is not None:
-            from .detection import YoloDetector, DetectionTracker
-            if args.detect_interval < 1:
-                raise ValueError("detect-interval must be positive")
-            detector = YoloDetector(args.weights, args.conf, args.imgsz, args.device, args.class_id,
-                                    args.nms_iou, args.backend, args.engine, args.onnx, args.profile)
-        else:
-            create_csrt()
+        detector = YoloDetector(args.weights, args.conf, args.imgsz, args.device, args.class_id,
+                                args.nms_iou, args.backend, args.engine, args.onnx, args.profile)
     cap = writer = None
     try:
         with perf.section("reader_open_ms"):
@@ -194,6 +186,7 @@ def run(args):
             if args.fallback_fps is None or not math.isfinite(args.fallback_fps) or args.fallback_fps <= 0:
                 raise ValueError("Video FPS unavailable; specify --fallback-fps")
             fps = args.fallback_fps
+        log_interval = max(1, round(fps)) if args.log_every is None else args.log_every
         with perf.section("start_frame_skip_ms"):
             for _ in range(args.start_frame):
                 if not cap.read()[0]:
@@ -204,20 +197,19 @@ def run(args):
                 raise ValueError("No readable frame at start-frame")
         height, width = frame.shape[:2]
         config = config_for_frame(args, frame.shape)
-        with perf.section("manual_selection_ms"):
-            box = args.roi if args.roi is not None else (None if detector else select_box(frame, args.window_size))
-        if box is None and detector is None:
-            print("Initialization cancelled; no output created.")
-            return None
+        box = args.roi
         if box is not None:
             box = validate_box(box, frame.shape)
-        if detector and args.detect_interval / fps > config.coast_seconds:
+        if args.detect_interval / fps > config.coast_seconds:
             raise ValueError("Detection interval exceeds coast-seconds")
         with perf.section("warmup_ms"):
-            if detector:
-                detector.warmup(frame, args.warmup)
+            detector.warmup(frame, args.warmup)
         scale = min(1., args.output_max_width / width) if args.output_max_width else 1.
         output_size = (max(2, int(width*scale)//2*2), max(2, int(height*scale)//2*2))
+        print(f"视频输入={width}x{height}，输出={output_size[0]}x{output_size[1]}，fps={fps:.3f}", flush=True)
+        print(f"推理后端={args.backend}，device={args.device}，imgsz={args.imgsz}，"
+              f"模型={detector.metadata.get('model_path', args.weights)}",
+              flush=True)
         output.mkdir(parents=True, exist_ok=False)
         actual_encoder = "none"
         with perf.section("writer_open_ms"):
@@ -225,14 +217,13 @@ def run(args):
                 writer = create_video_writer(output / "annotated.mp4", fps, *output_size,
                                              args.encoder, "mp4v", args.video_bitrate)
                 actual_encoder = "gstreamer" if isinstance(writer, GStreamerVideoWriter) else "opencv"
-        tracker = (DetectionTracker(detector, config, args.detect_interval, args.strict_motion_gate) if detector else
-                   SingleTargetTracker(config, appearance_mode=args.appearance))
+        tracker = DetectionTracker(detector, config, args.detect_interval, args.strict_motion_gate)
         clock = VideoClock(fps)
         index = args.start_frame
         paused = True
         history, estimated_history = deque(maxlen=250), deque(maxlen=250)
         counts, reasons = Counter(), Counter()
-        interventions = fallbacks = count = 0
+        interventions = fallbacks = count = detector_calls = 0
         end_reason = "end_of_readable_video"
         if not args.headless:
             cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
@@ -263,8 +254,7 @@ def run(args):
                 if frame.shape[:2] != (height, width):
                     raise ValueError("Frame dimensions changed within video")
                 stamp, stamp_source = clock.get(cap.get(cv2.CAP_PROP_POS_MSEC), index)
-                if detector:
-                    detector.last_timing = {}
+                detector.last_timing = {}
                 processing_started = time.perf_counter()
                 if args.mode == "detect-benchmark":
                     detections = detector.detect(frame)
@@ -276,7 +266,7 @@ def run(args):
                 else:
                     result = tracker.update(frame, stamp, index, stamp_source)
                 processing_ms = (time.perf_counter()-processing_started)*1000
-                if detector and result.get("detection_ran"):
+                if result.get("detection_ran"):
                     timing.update(detector.last_timing)
                 timing["tracking_ms"] = max(0., processing_ms - (timing.get("detector_ms") or 0.))
                 canvas = None
@@ -323,14 +313,15 @@ def run(args):
                 reasons[result["reason"]] += 1
                 fallbacks += stamp_source == "fps_fallback"
                 count += 1
+                detector_calls += bool(result.get("detection_ran"))
                 timing.update(frame_index=index, timestamp=stamp, state=result["state"],
-                              detection_ran=bool(detector and timing.get("detector_ms") is not None),
+                              detection_ran=bool(timing.get("detector_ms") is not None),
                               reason=result["reason"], frame_wall_ms=(time.perf_counter()-frame_started)*1000)
                 perf.rows.append(timing)
                 timing_writer.writerow(timing)
-                if args.log_every and count % args.log_every == 0:
-                    print(f"Processed {count} frames; detector calls={sum(r['detection_ran'] for r in perf.rows)}; "
-                          f"elapsed={time.perf_counter()-pipeline_started:.2f}s", flush=True)
+                if log_interval and count % log_interval == 0:
+                    print(f"已处理视频 {count} 帧，模型检测 {detector_calls} 帧，"
+                          f"耗时 {time.perf_counter()-pipeline_started:.2f}s", flush=True)
                 if quit_requested:
                     end_reason = "user_quit"
                     break
@@ -348,12 +339,12 @@ def run(args):
                 writer.release()
                 writer = None
         elapsed = time.perf_counter()-pipeline_started
-        environment = dict(opencv=cv2.__version__, detector=detector.metadata if detector else None,
+        environment = dict(opencv=cv2.__version__, detector=detector.metadata,
                            decoder=actual_decoder, encoder=actual_encoder, requested_decoder=args.decoder,
                            requested_encoder=args.encoder, read_ahead=args.read_ahead if actual_decoder == "gstreamer" else 0,
                            decode_prefetch=args.decode_prefetch if actual_decoder == "gstreamer" else 0,
                            input_size=[width, height], output_size=list(output_size),
-                           mode=args.mode, warmup_calls=args.warmup if detector else 0,
+                           mode=args.mode, warmup_calls=args.warmup,
                            profile=args.profile, headless=args.headless)
         from .runtime import hardware_info
         environment["hardware"] = hardware_info()
@@ -365,23 +356,24 @@ def run(args):
                        manual_reinitializations=interventions, timestamp_fallbacks=fallbacks,
                        wall_seconds=elapsed, throughput_fps=count/max(elapsed, 1e-9),
                        config=vars(config), initial_roi=list(box) if box else None, opencv=cv2.__version__,
-                       backend=detector.metadata['backend'] if detector else "legacy",
-                       detector=detector.metadata if detector else None,
-                       detect_interval=args.detect_interval if detector else None,
-                       strict_motion_gate=args.strict_motion_gate if detector else None,
-                       appearance_mode="disabled" if detector else args.appearance,
-                       appearance_active=bool(tracker.appearance and tracker.appearance.enabled),
+                       backend=detector.metadata['backend'],
+                       detector=detector.metadata,
+                       detect_interval=args.detect_interval,
+                       strict_motion_gate=args.strict_motion_gate,
                        performance_file="performance.json", notes=["Accepted observations are not ground truth.",
                        "FPS includes output finalization; GUI runs include user waits."])
         (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         (output / "performance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-        print(json.dumps(summary, indent=2))
+        print(f"视频处理完成：处理帧数={count}，模型检测帧数={report['detection_calls']}，"
+              f"纯预测帧数={counts['PREDICTED']}，无观测帧数={count-counts['TRACKING']}，"
+              f"人工重新初始化次数={interventions}，结束原因={end_reason}，输出={output}", flush=True)
         for name in ("read_wait_ms", "detector_ms", "inference_ms", "tracking_ms", "draw_ms", "data_write_ms", "video_submit_ms"):
             value = report["stages"][name]
             if value['count']:
                 print(f"{name}: count={value['count']} mean={value['mean_ms']:.3f} p95={value['p95_ms']:.3f}")
-        print(f"Finalize encoder={perf.sections['encoder_finalize_ms']:.3f}ms; "
-              f"pipeline FPS including finalize={report['pipeline_fps_with_finalize']:.3f}")
+        print(f"读取器收尾={perf.sections['reader_finalize_ms']:.3f}ms，"
+              f"编码器收尾={perf.sections['encoder_finalize_ms']:.3f}ms，"
+              f"含收尾实际处理速度={report['pipeline_fps_with_finalize']:.3f}fps", flush=True)
         return output
     finally:
         if cap is not None:
@@ -397,18 +389,18 @@ def run(args):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Offline YOLO or CSRT + Kalman single-target tracking")
+    p = argparse.ArgumentParser(description="Offline YOLO + Kalman single-target tracking")
     p.add_argument("video", help="Input video path")
     p.add_argument("--roi", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
-    p.add_argument("--headless", action="store_true", help="No windows; requires --roi or --weights")
-    p.add_argument("--weights", help="Local YOLO .pt weights; enables detection backend")
+    p.add_argument("--headless", action="store_true", help="No windows")
+    p.add_argument("--weights", required=True, help="Local YOLO .pt weights")
     p.add_argument("--backend", choices=("pt", "onnx", "tensorrt"), default="pt")
     p.add_argument("--engine", help="TensorRT engine built by tracking.export_model")
     p.add_argument("--onnx", help="ONNX model exported by tracking.export_model")
     p.add_argument("--mode", choices=("track", "detect-benchmark"), default="track")
     p.add_argument("--profile", choices=("throughput", "diagnostic"), default="throughput")
     p.add_argument("--warmup", type=int, default=5, help="Model warmup calls, excluded from steady-state timings")
-    p.add_argument("--log-every", type=int, default=100, help="Progress interval; 0 disables")
+    p.add_argument("--log-every", type=int, help="Progress interval in frames (default: about one video second; 0 disables)")
     p.add_argument("--decoder", choices=("auto", "opencv", "gstreamer"), default="auto")
     p.add_argument("--encoder", choices=("auto", "opencv", "gstreamer"), default="auto")
     p.add_argument("--decode-prefetch", type=int, choices=(1, 2), default=2)
@@ -425,11 +417,9 @@ def parser():
     p.add_argument("--device", default="cpu", help="YOLO device, e.g. cpu or 0")
     p.add_argument("--class-id", type=int, help="Restrict YOLO to one model class ID")
     p.add_argument("--window-size", nargs=2, type=int, default=(960, 540),
-                   metavar=("WIDTH", "HEIGHT"), help="Initial preview bounds (default: 960 540)")
-    p.add_argument("--appearance", choices=("auto", "off"), default="auto",
-                   help="Use local contrast tracking for separable ROIs (default: auto); off uses CSRT")
+                   metavar=("WIDTH", "HEIGHT"), help="GUI preview bounds (default: 960 540)")
     p.add_argument("--output", help="New output directory; existing directories are rejected")
-    p.add_argument("--start-frame", type=int, default=0, help="Zero-based initialization frame")
+    p.add_argument("--start-frame", type=int, default=0, help="Zero-based first processed frame")
     p.add_argument("--max-frames", type=int)
     p.add_argument("--gate", type=float, default=5.991, help="Squared Mahalanobis threshold")
     p.add_argument("--measurement-std", type=float, help="Image measurement std in pixels (default: resolution-scaled)")
@@ -437,7 +427,7 @@ def parser():
     p.add_argument("--initial-velocity-std", type=float, help="Initial velocity uncertainty in px/s (default: resolution-scaled)")
     p.add_argument("--coast-seconds", type=float, default=0.5, help="Max duration of displayed predictions")
     p.add_argument("--fallback-fps", type=float, help="Used only if video FPS is unavailable")
-    p.add_argument("--no-video", action="store_true", help="Export CSV/JSON only")
+    p.add_argument("--no-video", action="store_true", help="Do not save annotated video")
     return p
 
 

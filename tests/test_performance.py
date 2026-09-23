@@ -1,4 +1,6 @@
 import csv
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -32,11 +34,11 @@ class FakeDetector:
 
 
 class PerformanceTests(unittest.TestCase):
-    def make_video(self, root):
+    def make_video(self, root, frames=8):
         path = root / "source.avi"
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 25, (160, 120))
         self.assertTrue(writer.isOpened())
-        for _ in range(8):
+        for _ in range(frames):
             writer.write(np.zeros((120, 160, 3), np.uint8))
         writer.release()
         return path
@@ -76,6 +78,38 @@ class PerformanceTests(unittest.TestCase):
             with (output/"timing.csv").open(encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows[1]["inference_ms"], "")
+
+    def test_manual_roi_still_initializes_yolo_tracking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = self.make_video(root)
+            args = parser().parse_args([str(video), "--weights", "unused.pt", "--roi", "20", "30", "20", "20",
+                                        "--headless", "--no-video", "--output", str(root/"out")])
+            with patch("tracking.detection.YoloDetector", FakeDetector):
+                output = run(args)
+            rows = [json.loads(line) for line in (output/"track.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["source"], "manual")
+            self.assertEqual(rows[0]["center"], [30, 40])
+            self.assertTrue(rows[1]["detection_ran"])
+            self.assertEqual(rows[1]["state"], "LOST_PENDING")
+
+    def test_progress_reports_processed_frames_each_video_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = self.make_video(root, frames=26)
+            args = parser().parse_args([str(video), "--weights", "unused.pt", "--headless", "--no-video",
+                                        "--output", str(root/"out")])
+            printed = io.StringIO()
+            with patch("tracking.detection.YoloDetector", FakeDetector), redirect_stdout(printed):
+                run(args)
+            output = printed.getvalue()
+            self.assertIn("已处理视频 25 帧，模型检测 25 帧", output)
+            self.assertIn("视频处理完成：处理帧数=26，模型检测帧数=26", output)
+            self.assertNotIn("已处理视频 26 帧", output)
+
+    def test_weights_are_required_without_old_backend(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser().parse_args(["input.mp4"])
 
     def test_output_resize_preserves_observation_coordinates(self):
         frame = np.zeros((120, 160, 3), np.uint8)
