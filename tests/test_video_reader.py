@@ -15,7 +15,8 @@ import numpy as np
 
 from tracking.gst_decoder_worker import copy_bgrx, send_message
 from tracking.video_reader import (
-    GStreamerVideoCapture, PreparedVideoCapture, create_video_capture, decoder_parser, receive_message,
+    GStreamerVideoCapture, PreparedVideoCapture, create_video_capture, decoder_demux,
+    decoder_parser, receive_message,
 )
 
 
@@ -156,6 +157,9 @@ class ReaderTests(unittest.TestCase):
                 create_video_capture(Path('in.mp4'), 'gstreamer')
         self.assertEqual(decoder_parser(Path('in.mp4'), 'hevc'), 'h265parse')
         self.assertEqual(decoder_parser(Path('in.mov'), 'avc1'), 'h264parse')
+        self.assertEqual(decoder_parser(Path('in.ts'), 'hevc'), 'h265parse')
+        self.assertEqual(decoder_demux(Path('in.ts')), 'tsdemux')
+        self.assertEqual(decoder_demux(Path('in.mp4')), 'qtdemux')
         with self.assertRaises(RuntimeError):
             decoder_parser(Path('in.avi'), 'MJPG')
         capture.get.side_effect = lambda p: {
@@ -178,6 +182,8 @@ class ReaderTests(unittest.TestCase):
         for path, codec in (('in.avi', 'FMP4'), ('in.mp4', 'MJPG'), ('in.mp4', 'DIV3')):
             with self.assertRaises(RuntimeError):
                 decoder_parser(Path(path), codec)
+        with self.assertRaises(RuntimeError):
+            decoder_parser(Path('in.ts'), 'FMP4')
 
     def test_worker_accepts_mpeg4_parser(self):
         from tracking import gst_decoder_worker as worker
@@ -186,7 +192,7 @@ class ReaderTests(unittest.TestCase):
                 patch.object(worker, 'load_gst', return_value=(gst, Mock())) as load, \
                 patch('builtins.print'):
             self.assertEqual(worker.main(), 0)
-            load.assert_called_once_with('mpeg4videoparse')
+            load.assert_called_once_with('mpeg4videoparse', 'qtdemux')
 
     def metadata_capture(self):
         capture = Mock()
@@ -229,7 +235,7 @@ class ReaderTests(unittest.TestCase):
                 patch('tracking.video_reader.GStreamerVideoCapture', return_value=reader) as factory:
             result = create_video_capture(Path('in.mp4'), 'auto', read_ahead=0)
             self.assertIs(result, reader)
-            check.assert_called_once_with('/usr/bin/python3', 'mpeg4videoparse')
+            check.assert_called_once_with('/usr/bin/python3', 'mpeg4videoparse', 'qtdemux')
             self.assertEqual(factory.call_args.args[5], 'mpeg4videoparse')
             reader.prime.assert_called_once()
             capture.release.assert_called_once()
@@ -237,6 +243,21 @@ class ReaderTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'midstream error'):
                 result.read()
             capture.read.assert_not_called()
+
+    def test_ts_uses_tsdemux_without_unreliable_container_frame_count(self):
+        capture, reader = self.metadata_capture(), Mock()
+        capture.get.side_effect = lambda p: {
+            cv2.CAP_PROP_FPS: 25, 3: 320, 4: 180, cv2.CAP_PROP_FRAME_COUNT: 99,
+            cv2.CAP_PROP_FOURCC: cv2.VideoWriter_fourcc(*'hevc'),
+        }[p]
+        with patch('tracking.video_reader.cv2.VideoCapture', return_value=capture), \
+                patch('tracking.video_reader.is_jetson', return_value=True), \
+                patch('tracking.video_reader.check_decoder') as check, \
+                patch('tracking.video_reader.GStreamerVideoCapture', return_value=reader) as factory:
+            self.assertIs(create_video_capture(Path('segment.ts'), 'gstreamer', read_ahead=0), reader)
+            check.assert_called_once_with('/usr/bin/python3', 'h265parse', 'tsdemux')
+            self.assertEqual(factory.call_args.args[4], 0)
+            reader.prime.assert_called_once()
 
     def test_prime_rejects_empty_video(self):
         reader, remote = self.make_reader(expected=0)

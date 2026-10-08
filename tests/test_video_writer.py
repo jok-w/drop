@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from fractions import Fraction
@@ -10,7 +11,7 @@ import cv2
 import numpy as np
 
 from tracking.video_writer import (
-    GStreamerVideoWriter, check_gstreamer, create_video_writer, pipeline_command,
+    GStreamerVideoWriter, check_gstreamer, create_video_writer, pipeline_command, configure_pipe,
 )
 
 
@@ -21,10 +22,23 @@ class VideoWriterTests(unittest.TestCase):
         process.stdin.fileno.return_value = 123
         process.wait.return_value = 0
         with patch("tracking.video_writer.subprocess.Popen", return_value=process), \
+                patch("tracking.video_writer.configure_pipe", return_value=1024*1024), \
                 patch("tracking.video_writer.os.set_blocking", create=True):
             writer = GStreamerVideoWriter("gst-launch-1.0", Path(folder) / "输出 space.mp4",
                                           30000 / 1001, 6, 2, 8000000, timeout=timeout)
         return writer, process
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux pipe sizing")
+    def test_pipe_resize_permission_failure_uses_actual_capacity(self):
+        import fcntl
+        with patch("fcntl.fcntl", side_effect=[PermissionError("denied"), 65536]) as call:
+            self.assertEqual(configure_pipe(123), 65536)
+            self.assertEqual(call.call_args_list[0].args, (123, fcntl.F_SETPIPE_SZ, 1024*1024))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux pipe sizing")
+    def test_pipe_resize_uses_reported_capacity(self):
+        with patch("fcntl.fcntl", side_effect=[1024*1024, 1024*1024]):
+            self.assertEqual(configure_pipe(123), 1024*1024)
 
     def test_partial_pipe_writes_preserve_every_pixel_and_frame(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -110,6 +124,25 @@ class VideoWriterTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "元数据校验失败"):
                     writer.release()
             capture.release.assert_called_once()
+
+    def test_container_fps_rounding_is_accepted_but_wrong_rate_is_rejected(self):
+        for reported_fps, accepted in ((25.03, True), (25.1, False)):
+            with self.subTest(reported_fps=reported_fps), tempfile.TemporaryDirectory() as folder:
+                writer, process = self.make_writer(folder)
+                writer.frames = 16
+                writer.fps = 5007 / 200
+                writer.width, writer.height = 1920, 1080
+                process.poll.return_value = 0
+                capture = Mock()
+                capture.isOpened.return_value = True
+                capture.get.side_effect = [16, reported_fps, 1920, 1080]
+                with patch("tracking.video_writer.cv2.VideoCapture", return_value=capture):
+                    if accepted:
+                        writer.release()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "元数据校验失败"):
+                            writer.release()
+                capture.release.assert_called_once()
 
     def test_auto_uses_opencv_off_jetson_and_falls_back_only_during_probe(self):
         args = (Path("video.mp4"), 25, 320, 180)

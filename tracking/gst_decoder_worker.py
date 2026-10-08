@@ -13,14 +13,14 @@ import struct
 import time
 
 
-def load_gst(parser_name: str):
+def load_gst(parser_name: str, demux_name: str = "qtdemux"):
     import gi
     gi.require_version("Gst", "1.0")
     gi.require_version("GstApp", "1.0")
     gi.require_version("GstVideo", "1.0")
     from gi.repository import Gst, GstApp, GstVideo
     Gst.init(None)
-    for name in ("filesrc", "qtdemux", parser_name, "nvv4l2decoder", "nvvidconv", "appsink"):
+    for name in ("filesrc", demux_name, parser_name, "nvv4l2decoder", "nvvidconv", "appsink"):
         if not Gst.ElementFactory.find(name):
             raise RuntimeError(f"缺少 GStreamer 插件：{name}")
     return Gst, GstVideo
@@ -45,10 +45,10 @@ def copy_bgrx(data, destination, width, height, stride, offset=0):
                 offset + row * stride:offset + row * stride + row_size]
 
 
-def build_pipeline(Gst, path, parser_name, prefetch):
+def build_pipeline(Gst, path, parser_name, demux_name, prefetch):
     # Set the input property through the API; filenames never enter pipeline syntax.
     pipeline = Gst.parse_launch(
-        f"filesrc name=source ! qtdemux ! {parser_name} ! nvv4l2decoder ! "
+        f"filesrc name=source ! {demux_name} ! {parser_name} ! nvv4l2decoder ! "
         "nvvidconv ! video/x-raw,format=BGRx ! "
         f"appsink name=frames sync=false max-buffers={prefetch} drop=false "
         "enable-last-sample=false wait-on-eos=false")
@@ -61,8 +61,8 @@ def run(args):
     shared = mmap.mmap(args.memory_fd, args.width * args.height * 4)
     pipeline = None
     try:
-        Gst, GstVideo = load_gst(args.parser)
-        pipeline = build_pipeline(Gst, args.input, args.parser, args.prefetch)
+        Gst, GstVideo = load_gst(args.parser, args.demux)
+        pipeline = build_pipeline(Gst, args.input, args.parser, args.demux, args.prefetch)
         sink = pipeline.get_by_name("frames")
         bus = pipeline.get_bus()
         if pipeline.set_state(Gst.State.READY) == Gst.StateChangeReturn.FAILURE:
@@ -149,6 +149,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--parser", choices=("h264parse", "h265parse", "mpeg4videoparse"), required=True)
+    parser.add_argument("--demux", choices=("qtdemux", "tsdemux"), default="qtdemux")
     parser.add_argument("--input")
     parser.add_argument("--control-fd", type=int)
     parser.add_argument("--memory-fd", type=int)
@@ -158,7 +159,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=25)
     args = parser.parse_args()
     if args.check:
-        Gst, _ = load_gst(args.parser)
+        Gst, _ = load_gst(args.parser, args.demux)
         print(Gst.version_string())
         return 0
     return run(args)

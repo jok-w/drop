@@ -24,20 +24,26 @@ WORKER = Path(__file__).with_name("gst_decoder_worker.py")
 
 
 def decoder_parser(path: Path, codec: str) -> str:
-    if path.suffix.lower() not in {".mp4", ".mov"}:
-        raise RuntimeError("NVDEC 读取当前支持 MP4/MOV 中的 H.264/H.265/MPEG-4 Part 2")
+    suffix = path.suffix.lower()
+    if suffix not in {".mp4", ".mov", ".ts"}:
+        raise RuntimeError("NVDEC 读取当前支持 MP4/MOV/TS 中的 H.264/H.265，以及 MP4/MOV 中的 MPEG-4 Part 2")
     if codec.lower() in {"hevc", "hvc1", "hev1"}:
         return "h265parse"
     if codec.lower() in {"avc1", "h264", "x264"}:
         return "h264parse"
-    if codec.lower() in {"fmp4", "mp4v", "divx", "dx50", "xvid"}:
+    if suffix != ".ts" and codec.lower() in {"fmp4", "mp4v", "divx", "dx50", "xvid"}:
         return "mpeg4videoparse"
     raise RuntimeError(f"NVDEC 读取暂不支持输入编码：{codec!r}")
 
 
-def check_decoder(python: str, parser: str) -> None:
+def decoder_demux(path: Path) -> str:
+    return "tsdemux" if path.suffix.lower() == ".ts" else "qtdemux"
+
+
+def check_decoder(python: str, parser: str, demux: str = "qtdemux") -> None:
     try:
-        result = subprocess.run([python, "-I", str(WORKER), "--check", "--parser", parser],
+        result = subprocess.run([python, "-I", str(WORKER), "--check", "--parser", parser,
+                                 "--demux", demux],
                                 capture_output=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(f"无法检查系统 Python GStreamer：{error}") from error
@@ -92,7 +98,8 @@ class GStreamerVideoCapture:
             self._log = tempfile.TemporaryFile()
             self._process = subprocess.Popen(
                 [python, "-I", str(WORKER), "--input", str(path.resolve()),
-                 "--parser", parser, "--width", str(width), "--height", str(height),
+                 "--parser", parser, "--demux", decoder_demux(Path(path)),
+                 "--width", str(width), "--height", str(height),
                  "--prefetch", str(prefetch), "--timeout", str(timeout - 5),
                  "--control-fd", str(child.fileno()), "--memory-fd", str(self._memory.fileno())],
                 pass_fds=(child.fileno(), self._memory.fileno()), stdin=subprocess.DEVNULL,
@@ -367,11 +374,15 @@ def create_video_capture(path: Path, decoder="auto", prefetch=2, python="/usr/bi
             raise RuntimeError("NVDEC 读取需要 Jetson Linux")
         fps = probe.get(cv2.CAP_PROP_FPS)
         width, height = int(probe.get(3)), int(probe.get(4))
-        expected_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
+        # MPEG-TS has no authoritative container frame count; OpenCV commonly
+        # estimates it off by one. Validate TS by decoder EOS and delivered
+        # sequence instead of comparing with this estimate.
+        expected_frames = (0 if path.suffix.lower() == ".ts"
+                           else int(probe.get(cv2.CAP_PROP_FRAME_COUNT)))
         fourcc = int(probe.get(cv2.CAP_PROP_FOURCC))
         codec = "".join(chr((fourcc >> (8 * i)) & 255) for i in range(4))
         parser = decoder_parser(path, codec)
-        check_decoder(python, parser)
+        check_decoder(python, parser, decoder_demux(path))
         reader = GStreamerVideoCapture(path, fps, width, height, expected_frames, parser, python, prefetch)
         # READY/plugin presence does not prove that the stream can be decoded.
         # Keep the untouched OpenCV capture until a real first frame succeeds.

@@ -1,7 +1,10 @@
 import copy
 import unittest
 
-from tracking.model_artifacts import validate_engine, validate_source, ENGINE_STRATEGY
+from tracking.model_artifacts import (
+    validate_engine, validate_source, ENGINE_STRATEGY, FIXED_BATCH_ENGINE_STRATEGY,
+)
+from tracking.image_size import image_shape, size_label
 
 
 class ArtifactTests(unittest.TestCase):
@@ -26,7 +29,41 @@ class ArtifactTests(unittest.TestCase):
         metadata["end2end"] = True
         with self.assertRaises(ValueError):
             validate_source(metadata, "original")
+
+    def test_fixed_batch_engine_must_match_requested_batch(self):
+        metadata = self.metadata()
+        metadata["tracking"].update(strategy=FIXED_BATCH_ENGINE_STRATEGY, max_batch=4)
+        runtime = metadata["tracking"]["runtime"]
+        validate_engine(metadata, "original", 1280, runtime, batch_size=4)
+        for batch in (1, 2, 8):
+            with self.subTest(batch=batch), self.assertRaises(ValueError):
+                validate_engine(metadata, "original", 1280, runtime, batch_size=batch)
+        with self.assertRaises(ValueError):
+            validate_engine(metadata, "original", 1280, runtime, batch_size=0)
         metadata["end2end"] = False
         del metadata["tracking"]["postprocess"]
         with self.assertRaises(ValueError):
             validate_source(metadata, "original")
+
+    def test_rectangular_shape_and_header_must_both_match(self):
+        metadata = self.metadata()
+        metadata["tracking"]["image_size"] = [736, 1280]
+        metadata["imgsz"] = [736, 1280]
+        runtime = metadata["tracking"]["runtime"]
+        validate_engine(metadata, "original", (736, 1280), runtime)
+        for size in (1280, [1280, 736]):
+            with self.assertRaises(ValueError):
+                validate_engine(metadata, "original", size, runtime)
+        metadata["imgsz"] = [1280, 1280]
+        with self.assertRaises(ValueError):
+            validate_engine(metadata, "original", [736, 1280], runtime)
+
+    def test_legacy_square_sizes_and_invalid_shapes(self):
+        metadata = self.metadata()
+        validate_engine(metadata, "original", [1280], metadata["tracking"]["runtime"])
+        validate_engine(metadata, "original", [1280, 1280], metadata["tracking"]["runtime"])
+        self.assertEqual(size_label([1280]), "1280")
+        self.assertEqual(size_label([736, 1280]), "736x1280")
+        for invalid in (None, [], [1, 2, 3], 0, -32, [720, 1280], [736, 0], 1280.0):
+            with self.subTest(size=invalid), self.assertRaises(ValueError):
+                image_shape(invalid)

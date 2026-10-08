@@ -9,7 +9,9 @@ import select
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from collections import deque
 from fractions import Fraction
 from pathlib import Path
 
@@ -19,6 +21,23 @@ import numpy as np
 logger = logging.getLogger(__name__)
 GST_ELEMENTS = ("fdsrc", "rawvideoparse", "nvvidconv", "nvv4l2h264enc",
                 "h264parse", "qtmux", "filesink")
+PIPE_BUFFER_BYTES = 1024 * 1024
+
+
+def configure_pipe(fd: int) -> int:
+    """Use fewer pipe fragments for large frames; keep the OS default if resizing is denied."""
+    try:
+        import fcntl
+    except ImportError:
+        return 65536
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, PIPE_BUFFER_BYTES)
+    except OSError:
+        logger.debug("无法扩大视频管道缓冲，使用系统默认容量", exc_info=True)
+    try:
+        return fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+    except OSError:
+        return 65536
 
 
 def is_jetson() -> bool:
@@ -47,7 +66,7 @@ def pipeline_command(launch: str, path: Path, fps: float, width: int,
     rate = Fraction(fps).limit_denominator(100000)
     # Gst parses property strings itself, even though no shell is involved.
     location = str(path.resolve()).replace("\\", "\\\\").replace('"', '\\"')
-    return [launch, "-q", "-e", "fdsrc", "fd=0", "blocksize=65536", "!",
+    return [launch, "-q", "-e", "fdsrc", "fd=0", f"blocksize={PIPE_BUFFER_BYTES}", "!",
             "rawvideoparse", "format=bgrx", f"width={width}", f"height={height}",
             f"framerate={rate.numerator}/{rate.denominator}", "!",
             "nvvidconv", "!", "video/x-raw(memory:NVMM),format=NV12", "!",
@@ -69,6 +88,7 @@ class GStreamerVideoWriter:
         self.path, self.fps = path, fps
         self.width, self.height, self.timeout = width, height, timeout
         self.frames = 0
+        self._cancelled = threading.Event()
         self._closed = False
         self._last_details = ""
         # A regular file cannot deadlock on verbose encoder stderr like a PIPE can.
@@ -81,6 +101,7 @@ class GStreamerVideoWriter:
                 bufsize=0,
             )
             os.set_blocking(self._process.stdin.fileno(), False)
+            self.pipe_buffer_bytes = configure_pipe(self._process.stdin.fileno())
         except BaseException:
             self.abort()
             raise
@@ -108,6 +129,8 @@ class GStreamerVideoWriter:
         deadline = time.monotonic() + self.timeout
         try:
             while data:
+                if self._cancelled.is_set():
+                    raise OSError("视频写入已取消")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("向 GStreamer 提交视频帧超时")
@@ -116,7 +139,7 @@ class GStreamerVideoWriter:
                 if not select.select([], [fd], [], min(remaining, 0.5))[1]:
                     continue
                 try:
-                    written = os.write(fd, data[:65536])
+                    written = os.write(fd, data[:self.pipe_buffer_bytes])
                 except BlockingIOError:
                     continue
                 if written <= 0:
@@ -158,7 +181,9 @@ class GStreamerVideoWriter:
             if (not all(math.isfinite(v) for v in values)
                     or abs(count - self.frames) > 0.1
                     or (width, height) != (self.width, self.height)
-                    or not math.isclose(fps, self.fps, rel_tol=1e-4, abs_tol=1e-3)):
+                    # MP4 muxing can round a source rate such as 25.035 to
+                    # 25.03; that difference does not indicate dropped frames.
+                    or not math.isclose(fps, self.fps, rel_tol=1e-4, abs_tol=1e-2)):
                 raise RuntimeError(
                     f"硬件输出元数据校验失败：提交={self.frames} 帧，文件={count} 帧，"
                     f"尺寸={width}x{height}，fps={fps}，预期={self.width}x{self.height}@{self.fps}")
@@ -166,6 +191,10 @@ class GStreamerVideoWriter:
                         self.frames, self.width, self.height, fps)
         finally:
             capture.release()
+
+    def cancel_pending(self) -> None:
+        """Thread-safe cancellation request; resource cleanup stays on the writer thread."""
+        self._cancelled.set()
 
     def abort(self) -> None:
         """Bounded cleanup on failure; never hide the original processing exception."""
@@ -183,6 +212,131 @@ class GStreamerVideoWriter:
             logger.exception("清理 GStreamer 编码进程失败")
         finally:
             self._log.close()
+
+
+class AsyncVideoWriter:
+    """Single producer, bounded FIFO, one worker owning writes and finalization.
+
+    Frames are copied on submission so callers may safely reuse their canvas.
+    Only release() confirms that all submitted frames and the encoder have drained.
+    """
+
+    def __init__(self, writer, capacity=2, timeout=None):
+        if capacity not in (1, 2):
+            raise ValueError("异步输出队列容量必须是 1 或 2")
+        self.writer, self.capacity = writer, capacity
+        self.timeout = getattr(writer, "timeout", 30.0) if timeout is None else timeout
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("异步输出超时必须为有限正数")
+        self._condition = threading.Condition()
+        self._pending = deque()
+        self._closing = self._aborted = self._done = False
+        self._error = None
+        self.submitted = self.completed = self.peak_queue_depth = 0
+        self._write_times = []
+        self._thread = threading.Thread(target=self._run, name="video-encoder", daemon=True)
+        self._thread.start()
+
+    def _check(self):
+        if self._error is not None:
+            raise RuntimeError(f"异步视频输出失败：{self._error}") from self._error
+        if self._aborted:
+            raise RuntimeError("异步视频输出已取消")
+
+    def write(self, frame):
+        deadline = time.monotonic() + self.timeout
+        with self._condition:
+            while True:
+                self._check()
+                if self._closing or self._done:
+                    raise RuntimeError("异步视频输出已关闭")
+                if len(self._pending) < self.capacity:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("等待异步视频输出队列超时")
+                self._condition.wait(min(remaining, .1))
+            self._pending.append(frame.copy())
+            self.submitted += 1
+            self.peak_queue_depth = max(self.peak_queue_depth, len(self._pending))
+            self._condition.notify_all()
+
+    def _run(self):
+        released = False
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._pending or self._closing or self._aborted)
+                    if self._aborted:
+                        return
+                    if not self._pending:  # Closing, with the FIFO completely drained.
+                        break
+                    frame = self._pending.popleft()
+                    self._condition.notify_all()
+                started = time.perf_counter()
+                self.writer.write(frame)
+                duration = (time.perf_counter() - started) * 1000
+                with self._condition:
+                    self.completed += 1
+                    self._write_times.append(duration)
+                del frame
+            self.writer.release()
+            released = True
+        except BaseException as error:
+            with self._condition:
+                self._error = error
+                self._condition.notify_all()
+        finally:
+            if not released:
+                try:
+                    if hasattr(self.writer, "abort"):
+                        self.writer.abort()
+                    else:
+                        self.writer.release()
+                except BaseException as error:
+                    with self._condition:
+                        if self._error is None:
+                            self._error = error
+            with self._condition:
+                self._pending.clear()
+                self._done = True
+                self._condition.notify_all()
+
+    def release(self):
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+        # At most capacity pending writes, one active write, and encoder drain.
+        self._thread.join((self.capacity + 2) * self.timeout + 5)
+        if self._thread.is_alive():
+            self.abort()
+            raise RuntimeError("异步视频输出收尾超时")
+        with self._condition:
+            self._check()
+            if self.completed != self.submitted:
+                raise RuntimeError(f"异步输出帧数不匹配：提交={self.submitted}，完成={self.completed}")
+
+    def abort(self):
+        with self._condition:
+            if self._done:
+                return
+            self._aborted = True
+            self._pending.clear()
+            self._condition.notify_all()
+        # Never close/kill the underlying writer concurrently with its write/release.
+        if hasattr(self.writer, "cancel_pending"):
+            self.writer.cancel_pending()
+        self._thread.join(self.timeout + 5)
+        if self._thread.is_alive():
+            logger.error("异步视频输出线程未在超时内退出")
+
+    def statistics(self):
+        from .performance import stats
+        with self._condition:
+            return dict(queue_capacity=self.capacity, peak_queue_depth=self.peak_queue_depth,
+                        submitted_frames=self.submitted, completed_frames=self.completed,
+                        background_write_ms=stats(self._write_times),
+                        note="Background writes overlap foreground processing; do not add their time to frame_wall_ms.")
 
 
 def create_video_writer(path: Path, fps: float, width: int, height: int,

@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from .core import Config
+from .image_size import DEFAULT_IMAGE_SIZE
 
 
 WINDOW = "Single target | SPACE play/pause | N next | Q quit"
@@ -61,6 +62,8 @@ def draw(frame, result, history, estimated_history=()):
     lines = [f"Frame {result['frame_index']}  t={result['timestamp']:.3f}s  {result['state']}",
              f"{result['source']} | {result['reason']}",
              "Green: image | Orange: prediction"]
+    if result["segment"]:
+        lines[0] += f"  Target {result['segment']}"
     if result["mahalanobis_squared"] is not None:
         lines.append(f"Motion d^2 = {result['mahalanobis_squared']:.2f}")
     if result.get("estimated_center") is not None:
@@ -130,8 +133,11 @@ def config_for_frame(args, shape):
 def run(args):
     from .performance import Performance, STAGES, TIMING_FIELDS, reader_snapshot, reader_delta
     from .video_reader import create_video_capture, GStreamerVideoCapture, PreparedVideoCapture
-    from .video_writer import create_video_writer, GStreamerVideoWriter
+    from .video_writer import create_video_writer, GStreamerVideoWriter, AsyncVideoWriter
     perf = Performance()
+    if args.mode == "continuous-track" and args.max_frames is not None:
+        raise ValueError("--mode continuous-track conflicts with --max-frames; "
+                         "remove --max-frames to process the video until it ends")
     if args.start_frame < 0 or (args.max_frames is not None and args.max_frames <= 0):
         raise ValueError("start-frame must be >= 0 and max-frames must be > 0")
     if not args.weights:
@@ -141,6 +147,7 @@ def run(args):
     if args.onnx and args.backend != "onnx":
         raise ValueError("--onnx requires --backend onnx")
     if (min(args.window_size) <= 0 or args.output_max_width < 0 or args.warmup < 0
+            or args.encode_queue not in (0, 1, 2)
             or (args.log_every is not None and args.log_every < 0)):
         raise ValueError("Invalid window size, output width, warmup or log interval")
     if args.mode == "detect-benchmark" and (not args.headless or not args.no_video
@@ -191,12 +198,18 @@ def run(args):
               flush=True)
         output.mkdir(parents=True, exist_ok=False)
         actual_encoder = "none"
+        encoder_pipe_bytes = None
         with perf.section("writer_open_ms"):
             if not args.no_video:
                 writer = create_video_writer(output / "annotated.mp4", fps, *output_size,
                                              args.encoder, "mp4v", args.video_bitrate)
                 actual_encoder = "gstreamer" if isinstance(writer, GStreamerVideoWriter) else "opencv"
-        tracker = DetectionTracker(detector, config, args.detect_interval, args.strict_motion_gate)
+                encoder_pipe_bytes = getattr(writer, "pipe_buffer_bytes", None)
+                if args.encode_queue:
+                    writer = AsyncVideoWriter(writer, capacity=args.encode_queue)
+        continuous = args.mode == "continuous-track"
+        tracker = DetectionTracker(detector, config, args.detect_interval, args.strict_motion_gate,
+                                   continuous=continuous)
         clock = VideoClock(fps)
         index = args.start_frame
         paused = True
@@ -242,6 +255,10 @@ def run(args):
                                   detection_ran=True, detections=detections)
                 else:
                     result = tracker.update(frame, stamp, index, stamp_source)
+                if continuous and (result["state"] in ("WAITING", "LOST")
+                                   or (history and history[-1][1] != result["segment"])):
+                    history.clear()
+                    estimated_history.clear()
                 processing_ms = (time.perf_counter()-processing_started)*1000
                 if result.get("detection_ran"):
                     timing.update(detector.last_timing)
@@ -303,22 +320,29 @@ def run(args):
         with perf.section("reader_finalize_ms"):
             cap.release()
             cap = None
+        async_encoder_report = None
         with perf.section("encoder_finalize_ms"):
             if writer is not None:
                 writer.release()
+                if isinstance(writer, AsyncVideoWriter):
+                    async_encoder_report = writer.statistics()
                 writer = None
         elapsed = time.perf_counter()-pipeline_started
+        tracker.finish_segment(index, stamp, end_reason)
         environment = dict(opencv=cv2.__version__, detector=detector.metadata,
                            decoder=actual_decoder, encoder=actual_encoder, requested_decoder=args.decoder,
                            requested_encoder=args.encoder, read_ahead=args.read_ahead if actual_decoder == "gstreamer" else 0,
                            decode_prefetch=args.decode_prefetch if actual_decoder == "gstreamer" else 0,
                            input_size=[width, height], output_size=list(output_size),
                            mode=args.mode, warmup_calls=args.warmup,
+                           encode_queue=args.encode_queue if actual_encoder != "none" else 0,
+                           encoder_pipe_bytes=encoder_pipe_bytes,
                            profile=args.profile, headless=args.headless)
         from .runtime import hardware_info
         environment["hardware"] = hardware_info()
         environment["configuration"] = vars(args)
         report = perf.report(elapsed, environment)
+        report["async_encoder"] = async_encoder_report
         summary = dict(input=str(video), output=str(output), fps=fps, width=width, height=height,
                        frames=count, start_frame=args.start_frame, end_frame=index,
                        end_reason=end_reason, states=dict(counts), reasons=dict(reasons),
@@ -326,6 +350,7 @@ def run(args):
                        wall_seconds=elapsed, throughput_fps=count/max(elapsed, 1e-9),
                        config=vars(config), opencv=cv2.__version__,
                        backend=detector.metadata['backend'],
+                       mode=args.mode, segment_count=len(tracker.segments), segments=tracker.segments,
                        detector=detector.metadata,
                        detect_interval=args.detect_interval,
                        strict_motion_gate=args.strict_motion_gate,
@@ -336,6 +361,8 @@ def run(args):
         print(f"视频处理完成：处理帧数={count}，模型检测帧数={report['detection_calls']}，"
               f"纯预测帧数={counts['PREDICTED']}，无观测帧数={count-counts['TRACKING']}，"
               f"结束原因={end_reason}，输出={output}", flush=True)
+        if continuous:
+            print(f"持续追踪完成：轨迹段数={len(tracker.segments)}", flush=True)
         for name in ("read_wait_ms", "detector_ms", "inference_ms", "tracking_ms", "draw_ms", "data_write_ms", "video_submit_ms"):
             value = report["stages"][name]
             if value['count']:
@@ -348,7 +375,7 @@ def run(args):
         if cap is not None:
             cap.release()
         if writer is not None:
-            if isinstance(writer, GStreamerVideoWriter):
+            if isinstance(writer, (GStreamerVideoWriter, AsyncVideoWriter)):
                 writer.abort()
             else:
                 writer.release()
@@ -365,30 +392,35 @@ def parser():
     p.add_argument("--backend", choices=("pt", "onnx", "tensorrt"), default="pt")
     p.add_argument("--engine", help="TensorRT engine built by tracking.export_model")
     p.add_argument("--onnx", help="ONNX model exported by tracking.export_model")
-    p.add_argument("--mode", choices=("track", "detect-benchmark"), default="track")
+    p.add_argument("--mode", choices=("track", "continuous-track", "detect-benchmark"), default="track",
+                   help="continuous-track keeps looking for successive objects until video end")
     p.add_argument("--profile", choices=("throughput", "diagnostic"), default="throughput")
     p.add_argument("--warmup", type=int, default=5, help="Model warmup calls, excluded from steady-state timings")
     p.add_argument("--log-every", type=int, help="Progress interval in frames (default: about one video second; 0 disables)")
     p.add_argument("--decoder", choices=("auto", "opencv", "gstreamer"), default="auto")
     p.add_argument("--encoder", choices=("auto", "opencv", "gstreamer"), default="auto")
+    p.add_argument("--encode-queue", type=int, choices=(0, 1, 2), default=0,
+                   help="Pending output frames: 0=synchronous (default), 1/2=bounded asynchronous")
     p.add_argument("--decode-prefetch", type=int, choices=(1, 2), default=2)
     p.add_argument("--read-ahead", type=int, choices=(0, 1, 2), default=2)
     p.add_argument("--gst-python", default="/usr/bin/python3")
     p.add_argument("--video-bitrate", type=int, default=8000000)
     p.add_argument("--output-max-width", type=int, default=0, help="Saved/display width limit; 0 preserves original")
-    p.add_argument("--detect-interval", type=int, default=1, help="Detect every N decoded frames (default: 1)")
+    p.add_argument("--detect-interval", type=int, default=1,
+                   help="Detect every N frames; continuous-track searches every frame while waiting (default: 1)")
     p.add_argument("--conf", type=float, default=.25, help="YOLO confidence threshold")
     p.add_argument("--nms-iou", type=float, default=.5, help="YOLO overlap suppression threshold")
     p.add_argument("--strict-motion-gate", action="store_true",
                    help="Reject even a unique detection when it disagrees with the motion prior")
-    p.add_argument("--imgsz", type=int, default=1280, help="YOLO inference image size (default: 1280)")
+    p.add_argument("--imgsz", type=int, nargs="+", default=DEFAULT_IMAGE_SIZE,
+                   help=f"Inference SIZE or HEIGHT WIDTH, multiples of 32 (default: {DEFAULT_IMAGE_SIZE})")
     p.add_argument("--device", default="cpu", help="YOLO device, e.g. cpu or 0")
     p.add_argument("--class-id", type=int, help="Restrict YOLO to one model class ID")
     p.add_argument("--window-size", nargs=2, type=int, default=(960, 540),
                    metavar=("WIDTH", "HEIGHT"), help="GUI preview bounds (default: 960 540)")
     p.add_argument("--output", help="New output directory; existing directories are rejected")
     p.add_argument("--start-frame", type=int, default=0, help="Zero-based first processed frame")
-    p.add_argument("--max-frames", type=int)
+    p.add_argument("--max-frames", type=int, help="Total processed-frame limit; incompatible with continuous-track")
     p.add_argument("--gate", type=float, default=5.991, help="Squared Mahalanobis threshold")
     p.add_argument("--measurement-std", type=float, help="Image measurement std in pixels (default: resolution-scaled)")
     p.add_argument("--acceleration-std", type=float, help="Motion noise std in px/s^2 (default: resolution-scaled)")

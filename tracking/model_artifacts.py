@@ -7,9 +7,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .image_size import image_shape
+
 
 SCHEMA_VERSION = 1
 ENGINE_STRATEGY = "single-image-fp16-v1"
+FIXED_BATCH_ENGINE_STRATEGY = "fixed-batch-fp16-v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -60,13 +63,21 @@ def validate_source(metadata: dict, source_hash: str) -> dict:
     return tracking
 
 
-def validate_engine(metadata: dict, source_hash: str, image_size: int, runtime: dict) -> dict:
+def validate_engine(metadata: dict, source_hash: str, image_size: int | list[int] | tuple[int, int],
+                    runtime: dict, batch_size: int = 1) -> dict:
     tracking = validate_source(metadata, source_hash)
-    if (tracking.get("strategy") != ENGINE_STRATEGY or tracking.get("max_batch") != 1
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError("batch_size 必须为正整数")
+    strategy = ENGINE_STRATEGY if batch_size == 1 else FIXED_BATCH_ENGINE_STRATEGY
+    if (tracking.get("strategy") != strategy or tracking.get("max_batch") != batch_size
             or tracking.get("dynamic") is not False):
-        raise ValueError("engine 不是当前固定 batch=1 的单图策略（可能为旧分片模型），请重新构建")
-    if tracking.get("image_size") != image_size:
+        raise ValueError(f"engine 不是当前固定 batch={batch_size} 的策略，请重新构建或选择匹配的 engine")
+    requested_shape = image_shape(image_size)
+    if image_shape(tracking.get("image_size")) != requested_shape:
         raise ValueError(f"静态 engine 不支持 imgsz={image_size}，请重新构建")
+    # Ultralytics uses header imgsz to override the requested predictor shape.
+    if "imgsz" in metadata and image_shape(metadata["imgsz"]) != requested_shape:
+        raise ValueError("engine 的 imgsz 与 tracking 输入尺寸不一致，请重新构建")
     if tracking.get("precision") != "fp16":
         raise ValueError("当前只支持项目导出的 FP16 engine")
     environment = tracking.get("runtime")

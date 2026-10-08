@@ -135,10 +135,18 @@ class PerformanceTests(unittest.TestCase):
     def test_comparison_counts_missing_boxes_and_rejects_frame_mismatch(self):
         a = dict(frame_index=1, timestamp=.04, detections=[dict(bbox=[0, 0, 20, 20], class_id=0)])
         b = dict(a, detections=[])
-        self.assertEqual(compare([a], [b])["unmatched_pt_boxes"], 1)
+        self.assertEqual(compare([a], [b])["unmatched_baseline_boxes"], 1)
+        self.assertEqual(compare([a], [b])["baseline_only_frames"], [1])
+        self.assertEqual(compare([b], [a])["candidate_only_frames"], [1])
         self.assertEqual(compare([a], [a])["mean_matched_iou"], 1.)
         with self.assertRaises(ValueError):
             compare([a], [dict(b, frame_index=2)])
+
+    def test_rectangular_cli_survives_benchmark_subprocess_command(self):
+        args = parser().parse_args(["a video.mp4", "--weights", "a model.pt", "--imgsz", "736", "1280"])
+        command = command_for(args)
+        restored = parser().parse_args(command[2:])
+        self.assertEqual(restored.imgsz, [736, 1280])
 
     def test_empty_stage_is_not_zero_latency(self):
         self.assertIsNone(stats([None, None])["mean_ms"])

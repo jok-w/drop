@@ -5,11 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from tracking.export_model import build_engine
-from tracking.model_artifacts import ENGINE_STRATEGY, read_engine_metadata
+from tracking.model_artifacts import ENGINE_STRATEGY, FIXED_BATCH_ENGINE_STRATEGY, read_engine_metadata
 
 
 class EngineBuildTests(unittest.TestCase):
-    def build(self, size=640, fail_warmup=False):
+    def build(self, size=640, fail_warmup=False, batch=1):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -30,8 +30,10 @@ class EngineBuildTests(unittest.TestCase):
                               MemoryPoolType=SimpleNamespace(WORKSPACE="workspace"),
                               BuilderFlag=SimpleNamespace(FP16="fp16"), float32="float32")
         yolo = Mock()
-        yolo.predict.side_effect = (RuntimeError("warmup failed") if fail_warmup else
-                                    lambda **kw: [SimpleNamespace(boxes=None)])
+        def prediction(**kwargs):
+            count = len(kwargs["source"]) if isinstance(kwargs["source"], list) else 1
+            return [SimpleNamespace(boxes=None) for _ in range(count)]
+        yolo.predict.side_effect = RuntimeError("warmup failed") if fail_warmup else prediction
         metadata = {"task": "detect", "names": {0: "stand"}, "tracking": {
             "schema": 1, "source_sha256": "hash", "dynamic": True, "precision": "fp32", "ultralytics": "test",
             "postprocess": "external-nms"}}
@@ -41,9 +43,9 @@ class EngineBuildTests(unittest.TestCase):
                 patch("tracking.export_model.read_onnx_metadata", return_value=metadata):
             if fail_warmup:
                 with self.assertRaisesRegex(RuntimeError, "warmup failed"):
-                    build_engine(onnx, output, size)
+                    build_engine(onnx, output, size, batch_size=batch)
             else:
-                build_engine(onnx, output, size)
+                build_engine(onnx, output, size, batch_size=batch)
         return tensor, builder, yolo, output
 
     def test_global_engine_is_fixed_batch_one_and_metadata_is_preserved(self):
@@ -67,9 +69,31 @@ class EngineBuildTests(unittest.TestCase):
         builder.create_optimization_profile.assert_not_called()
         self.assertFalse(read_engine_metadata(output)["dynamic"])
 
+    def test_multi_image_engine_has_fixed_batch_and_matching_warmup(self):
+        tensor, builder, model, output = self.build(batch=4)
+        self.assertEqual(tensor.shape, (4, 3, 640, 640))
+        builder.create_optimization_profile.assert_not_called()
+        source = model.predict.call_args.kwargs["source"]
+        self.assertEqual(len(source), 4)
+        self.assertTrue(all(frame.shape == (640, 640, 3) for frame in source))
+        metadata = read_engine_metadata(output)
+        self.assertEqual(metadata["batch"], 4)
+        self.assertEqual(metadata["tracking"]["max_batch"], 4)
+        self.assertEqual(metadata["tracking"]["strategy"], FIXED_BATCH_ENGINE_STRATEGY)
+        self.assertEqual(metadata["args"]["batch"], 4)
+
     def test_failed_warmup_preserves_existing_engine(self):
         _, _, _, output = self.build(fail_warmup=True)
         self.assertEqual(output.read_bytes(), b"previous valid engine")
+
+    def test_rectangular_engine_header_and_warmup_use_height_width_order(self):
+        tensor, _, model, output = self.build(size=[736, 1280])
+        self.assertEqual(tensor.shape, (1, 3, 736, 1280))
+        self.assertEqual(model.predict.call_args.kwargs["source"].shape, (736, 1280, 3))
+        self.assertEqual(model.predict.call_args.kwargs["imgsz"], [736, 1280])
+        metadata = read_engine_metadata(output)
+        self.assertEqual(metadata["imgsz"], [736, 1280])
+        self.assertEqual(metadata["tracking"]["image_size"], [736, 1280])
 
 
 if __name__ == "__main__":

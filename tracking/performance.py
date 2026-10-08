@@ -58,6 +58,8 @@ class Performance:
                    "GPU library stage timings synchronize CUDA; they are not pure kernel latency.",
                    "Background preparation overlaps foreground processing; do not add it to wall time.",
                    "Video submit means encoder submission, not durable disk completion.",
+                   "With async output, video_submit_ms includes frame copy and queue wait; background writes overlap processing.",
+                   "Encoder finalize includes draining the async queue before finalizing the video.",
                    "Finalize includes buffered file closes and encoder drain, not an fsync durability guarantee.",
                    "Initial cached frame read is in startup; pipeline includes its inference.",
                    "frame_wall_ms excludes the timing-row write and progress printing; pipeline includes both.",

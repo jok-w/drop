@@ -1,4 +1,4 @@
-"""PT → FP32 ONNX → target-device TensorRT 10 FP16, fixed batch=1."""
+"""PT → FP32 ONNX → target-device TensorRT 10 FP16 fixed-batch engines."""
 from __future__ import annotations
 
 import argparse
@@ -11,8 +11,10 @@ from pathlib import Path
 
 import numpy as np
 
+from .image_size import DEFAULT_IMAGE_SIZE, canonical_size, image_shape, size_label
 from .model_artifacts import (
-    ENGINE_STRATEGY, SCHEMA_VERSION, file_sha256, read_onnx_metadata, runtime_info, validate_source,
+    ENGINE_STRATEGY, FIXED_BATCH_ENGINE_STRATEGY, SCHEMA_VERSION, file_sha256,
+    read_onnx_metadata, runtime_info, validate_source,
 )
 
 
@@ -20,12 +22,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "models" / "detect.pt"
 
 
-def check_size(size: int) -> None:
-    if size < 32 or size % 32:
-        raise ValueError("输入尺寸必须是正的 32 倍数")
+def check_size(size) -> None:
+    image_shape(size)
 
 
-def export_onnx(model_path: Path, output: Path, image_size: int = 640,
+def export_onnx(model_path: Path, output: Path, image_size: int | list[int] | tuple[int, int] = DEFAULT_IMAGE_SIZE,
                 opset: int = 17) -> Path:
     """使用临时目录导出 FP32 ONNX，验证图并保留原 PT，不覆盖已有 ONNX 直到成功。"""
     from .runtime import configure_runtime
@@ -36,7 +37,8 @@ def export_onnx(model_path: Path, output: Path, image_size: int = 640,
     import ultralytics
     from ultralytics import YOLO
 
-    check_size(image_size)
+    height, width = image_shape(image_size)
+    image_size = canonical_size(image_size)
     if model_path.suffix.lower() != ".pt" or not model_path.is_file():
         raise ValueError(f"需要有效的 PT 模型：{model_path}")
     if output.suffix.lower() != ".onnx":
@@ -65,7 +67,7 @@ def export_onnx(model_path: Path, output: Path, image_size: int = 640,
         onnx.save_model(graph, str(exported), save_as_external_data=False)
         # Validate the requested size; preserve dynamic dimensions for later builds.
         session = onnxruntime.InferenceSession(str(exported), providers=["CPUExecutionProvider"])
-        for shape in ((1, 3, image_size, image_size),):
+        for shape in ((1, 3, height, width),):
             outputs = session.run(None, {session.get_inputs()[0].name: np.zeros(shape, dtype=np.float32)})
             if not outputs or outputs[0].shape[0] != shape[0] or not np.isfinite(outputs[0]).all():
                 raise RuntimeError(f"ONNX 预热结果无效：{shape}")
@@ -75,16 +77,19 @@ def export_onnx(model_path: Path, output: Path, image_size: int = 640,
     return output
 
 
-def build_engine(onnx_path: Path, output: Path, image_size: int,
-                 device: str = "0", workspace: float = 2.0) -> Path:
-    """由已有 ONNX 构建固定 batch=1 和空间尺寸的 engine，预热成功后才发布文件。"""
+def build_engine(onnx_path: Path, output: Path, image_size: int | list[int] | tuple[int, int],
+                 device: str = "0", workspace: float = 2.0, batch_size: int = 1) -> Path:
+    """由已有 ONNX 构建固定 batch/空间尺寸的 engine，预热成功后才发布文件。"""
     from .runtime import configure_runtime
     configure_runtime()
     import torch
     import tensorrt as trt
     from ultralytics import YOLO
 
-    check_size(image_size)
+    height, width = image_shape(image_size)
+    image_size = canonical_size(image_size)
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or not 1 <= batch_size <= 16:
+        raise ValueError("batch 必须是 1 到 16 的整数")
     if not workspace > 0 or not np.isfinite(workspace):
         raise ValueError("workspace 必须是有限正数，单位 GiB")
     if output.suffix.lower() != ".engine":
@@ -115,22 +120,24 @@ def build_engine(onnx_path: Path, output: Path, image_size: int,
     inp = network.get_input(0)
     if tuple(inp.shape) != (-1, 3, -1, -1) or inp.dtype != trt.float32:
         raise ValueError(f"ONNX 输入应为动态 FP32 NCHW，实际为 {inp.shape} / {inp.dtype}")
-    # 全局整帧与局部裁剪均一次输入一张图；不再为旧分片创建动态 batch profile。
-    inp.shape = (1, 3, image_size, image_size)
+    # 固定 batch 避免真实测试时被动态 profile 或自动 padding 混淆。
+    inp.shape = (batch_size, 3, height, width)
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace * (1 << 30)))
     if not getattr(builder, "platform_has_fast_fp16", True):
         raise ValueError("当前 GPU 不支持快速 FP16")
     config.set_flag(trt.BuilderFlag.FP16)
-    logger.info("构建静态 TensorRT FP16：1x3x%sx%s，workspace=%s GiB", image_size, image_size, workspace)
+    logger.info("构建静态 TensorRT FP16：%sx3x%sx%s，workspace=%s GiB",
+                batch_size, height, width, workspace)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError("TensorRT engine 构建失败；请检查解析日志、内存和 workspace")
-    metadata.update(batch=1, imgsz=[image_size, image_size], dynamic=False)
-    metadata["args"] = {"dynamic": False, "nms": None}
+    metadata.update(batch=batch_size, imgsz=[height, width], dynamic=False)
+    metadata["args"] = {"batch": batch_size, "dynamic": False, "nms": None}
     metadata["tracking"] = {
         **tracking, "onnx_sha256": file_sha256(onnx_path), "image_size": image_size,
-        "max_batch": 1, "dynamic": False, "strategy": ENGINE_STRATEGY,
+        "max_batch": batch_size, "dynamic": False,
+        "strategy": ENGINE_STRATEGY if batch_size == 1 else FIXED_BATCH_ENGINE_STRATEGY,
         "precision": "fp16", "runtime": environment,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -145,11 +152,12 @@ def build_engine(onnx_path: Path, output: Path, image_size: int,
         # 释放构建资源后再加载，降低 Jetson 内存峰值。
         del serialized, parser, network, config, builder
         model = YOLO(str(candidate), task="detect")
-        frame = np.zeros((image_size, image_size, 3), dtype=np.uint8)
-        results = model.predict(source=frame, imgsz=image_size, device=device,
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        source = frame if batch_size == 1 else [frame.copy() for _ in range(batch_size)]
+        results = model.predict(source=source, imgsz=image_size, device=device,
                                 rect=False, verbose=False, agnostic_nms=True, stream=False)
-        if len(results) != 1:
-            raise RuntimeError("TensorRT 单图预热必须返回一张图的结果")
+        if len(results) != batch_size:
+            raise RuntimeError(f"TensorRT batch 预热结果数量错误：{len(results)} != {batch_size}")
         torch.cuda.synchronize(int(device))
         del model
         candidate.replace(output)
@@ -163,14 +171,18 @@ def build_parser() -> argparse.ArgumentParser:
     onnx = commands.add_parser("pt-to-onnx", help="导出 FP32 动态 ONNX")
     onnx.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     onnx.add_argument("--output", type=Path)
-    onnx.add_argument("--imgsz", type=int, default=1280)
+    onnx.add_argument("--imgsz", type=int, nargs="+", default=DEFAULT_IMAGE_SIZE,
+                      help=f"SIZE or HEIGHT WIDTH, multiples of 32 (default: {DEFAULT_IMAGE_SIZE})")
     onnx.add_argument("--opset", type=int, default=17)
     engine = commands.add_parser("onnx-to-engine", help="在目标 Jetson 构建一个固定尺寸 FP16 engine")
     engine.add_argument("--onnx", type=Path, default=DEFAULT_MODEL.with_suffix(".onnx"))
     engine.add_argument("--output", type=Path)
-    engine.add_argument("--imgsz", type=int, default=1280)
+    engine.add_argument("--imgsz", type=int, nargs="+", default=DEFAULT_IMAGE_SIZE,
+                        help=f"SIZE or HEIGHT WIDTH, multiples of 32 (default: {DEFAULT_IMAGE_SIZE})")
     engine.add_argument("--device", default="0")
     engine.add_argument("--workspace", type=float, default=2.0, help="构建 workspace 上限，单位 GiB")
+    engine.add_argument("--batch", "--batch-size", dest="batch", type=int, default=1,
+                        help="固定 batch 大小，1-16（默认 1）")
     return parser
 
 
@@ -182,8 +194,10 @@ def main() -> int:
         if args.command == "pt-to-onnx":
             export_onnx(args.model, args.output or args.model.with_suffix(".onnx"), args.imgsz, args.opset)
         else:
-            output = args.output or args.onnx.with_name(f"{args.onnx.stem}.{args.imgsz}.fp16.engine")
-            build_engine(args.onnx, output, args.imgsz, args.device, args.workspace)
+            batch_label = "" if args.batch == 1 else f".b{args.batch}"
+            output = args.output or args.onnx.with_name(
+                f"{args.onnx.stem}.{size_label(args.imgsz)}{batch_label}.fp16.engine")
+            build_engine(args.onnx, output, args.imgsz, args.device, args.workspace, args.batch)
     except (ImportError, ValueError, RuntimeError, OSError) as error:
         cli.exit(2, f"Build failed: {error}\nTensorRT builds require the target CUDA GPU and its TensorRT 10 runtime.\n")
     return 0

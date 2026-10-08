@@ -1,4 +1,4 @@
-"""Sequential isolated PT/candidate comparisons; identical frames and input shapes."""
+"""Sequential isolated backend/shape comparisons on identical video frames."""
 import argparse
 import copy
 import json
@@ -10,6 +10,7 @@ import sys
 import numpy as np
 
 from .app import parser as tracking_parser
+from .image_size import image_shape
 
 
 def command_for(args):
@@ -60,10 +61,17 @@ def compare(left, right):
             errors.append(float(np.hypot(ax+aw/2-bx-bw/2, ay+ah/2-by-bh/2)))
         unmatched_left += len(aa)-len(used_a)
         unmatched_right += len(bb)-len(used_b)
+    baseline_only = [a["frame_index"] for a, b in zip(left, right)
+                     if a.get("detections") and not b.get("detections")]
+    candidate_only = [a["frame_index"] for a, b in zip(left, right)
+                      if b.get("detections") and not a.get("detections")]
     return dict(frames=len(left), matched_boxes=len(overlaps),
                 mean_matched_iou=float(np.mean(overlaps)) if overlaps else None,
                 mean_matched_center_difference_px=float(np.mean(errors)) if errors else None,
-                unmatched_pt_boxes=unmatched_left, unmatched_candidate_boxes=unmatched_right,
+                unmatched_baseline_boxes=unmatched_left, unmatched_candidate_boxes=unmatched_right,
+                baseline_detected_frames=sum(bool(r.get("detections")) for r in left),
+                candidate_detected_frames=sum(bool(r.get("detections")) for r in right),
+                baseline_only_frames=baseline_only, candidate_only_frames=candidate_only,
                 detection_count_mismatch_frames=count_mismatch,
                 note="Same-class greedy IoU>=0.5 matching; consistency, not ground-truth accuracy.")
 
@@ -73,29 +81,45 @@ def main():
     parser.description = __doc__
     parser.set_defaults(max_frames=300, warmup=10, headless=True, no_video=True, mode="detect-benchmark")
     parser.add_argument("--candidate", choices=("onnx", "tensorrt"), default="tensorrt")
+    parser.add_argument("--baseline", choices=("pt", "onnx", "tensorrt"), default="pt")
+    parser.add_argument("--baseline-engine", help="Optional baseline TensorRT engine")
+    parser.add_argument("--candidate-imgsz", nargs="+", type=int,
+                        help="Candidate SIZE or HEIGHT WIDTH; defaults to --imgsz")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--report-dir", required=True)
     args = parser.parse_args()
     if args.repeats < 1 or args.mode != "detect-benchmark" or not args.weights:
         parser.error("Requires --weights, repeats>=1 and detect-benchmark mode")
+    try:
+        image_shape(args.imgsz)
+        image_shape(args.candidate_imgsz or args.imgsz)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.baseline_engine and args.baseline != "tensorrt":
+        parser.error("--baseline-engine requires --baseline tensorrt")
+    if args.engine and args.candidate != "tensorrt":
+        parser.error("--engine requires --candidate tensorrt")
     folder = Path(args.report_dir).resolve()
     folder.mkdir(parents=True, exist_ok=False)
     runs, comparisons = [], []
     for repeat in range(args.repeats):
         # Alternate order across repeats to reduce systematic cache/thermal ordering bias.
-        backends = ("pt", args.candidate) if repeat % 2 == 0 else (args.candidate, "pt")
+        roles = ("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")
         records = {}
-        for backend in backends:
+        for role in roles:
+            backend = args.baseline if role == "baseline" else args.candidate
             config = copy.copy(args)
             config.backend = backend
+            config.imgsz = args.imgsz if role == "baseline" else (args.candidate_imgsz or args.imgsz)
+            config.engine = args.baseline_engine if role == "baseline" else args.engine
             if backend != "tensorrt":
                 config.engine = None
             if backend != "onnx":
                 config.onnx = None
-            config.output = str(folder / f"{repeat+1}_{backend}")
+            config.output = str(folder / f"{repeat+1}_{role}")
             command = command_for(config)
-            log = folder / f"{repeat+1}_{backend}.log"
-            print(f"Run {repeat+1}/{args.repeats}: {backend}", flush=True)
+            log = folder / f"{repeat+1}_{role}.log"
+            print(f"Run {repeat+1}/{args.repeats}: {role} {backend} {config.imgsz}", flush=True)
             with log.open("w", encoding="utf-8") as stream:
                 result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)
             if result.returncode:
@@ -109,14 +133,18 @@ def main():
                 raise RuntimeError("Runtime model format differs from requested backend")
             if report["detection_calls"] != report["frames"]:
                 raise RuntimeError("Benchmark must infer on every frame")
-            runs.append(dict(repeat=repeat+1, backend=backend, output=str(output), performance=report))
-            records[backend] = [json.loads(line) for line in (output / "track.jsonl").read_text().splitlines()]
-        comparisons.append(compare(records["pt"], records[args.candidate]))
-    medians = {backend: statistics.median(r["performance"]["stages"]["detector_ms"]["mean_ms"]
-                                         for r in runs if r["backend"] == backend)
-               for backend in ("pt", args.candidate)}
+            if args.max_frames and report["frames"] != args.max_frames:
+                raise RuntimeError("Video ended before the requested benchmark frame count")
+            if image_shape(report["environment"]["detector"]["imgsz"]) != image_shape(config.imgsz):
+                raise RuntimeError("Actual detector shape differs from requested shape")
+            runs.append(dict(repeat=repeat+1, role=role, backend=backend, output=str(output), performance=report))
+            records[role] = [json.loads(line) for line in (output / "track.jsonl").read_text().splitlines()]
+        comparisons.append(compare(records["baseline"], records["candidate"]))
+    medians = {role: statistics.median(r["performance"]["stages"]["detector_ms"]["mean_ms"]
+                                      for r in runs if r["role"] == role)
+               for role in ("baseline", "candidate")}
     report = dict(runs=runs, comparisons=comparisons, median_detector_mean_ms=medians,
-                  detector_speedup=medians["pt"]/medians[args.candidate],
+                  detector_speedup=medians["baseline"]/medians["candidate"],
                   note="No drawing/video encoding. Includes data output. Hardware clocks/power must be held comparable externally.")
     (folder / "comparison.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Detector speedup={report['detector_speedup']:.3f}; {folder / 'comparison.json'}")

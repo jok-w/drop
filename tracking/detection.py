@@ -5,17 +5,21 @@ import time
 
 import numpy as np
 
+from .image_size import DEFAULT_IMAGE_SIZE, canonical_size, size_label
 from .core import Config, MotionFilter, center_of, validate_box
 
 
 class YoloDetector:
-    def __init__(self, weights, confidence=.25, image_size=1280, device="cpu", class_id=None, iou=.5,
-                 backend="pt", engine=None, onnx=None, profile="throughput"):
+    def __init__(self, weights, confidence=.25, image_size=DEFAULT_IMAGE_SIZE, device="cpu", class_id=None, iou=.5,
+                 backend="pt", engine=None, onnx=None, profile="throughput", batch_size=1):
         path = Path(weights).resolve()
         if not path.is_file():
             raise ValueError(f"Weights do not exist: {path}")
-        if not 0 < confidence <= 1 or image_size <= 0 or not 0 < iou <= 1:
+        image_size = canonical_size(image_size)
+        if not 0 < confidence <= 1 or not 0 < iou <= 1:
             raise ValueError("confidence/iou must be in (0, 1] and image-size must be positive")
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         # Keep runtime settings in the project, including on restricted desktops.
         from .runtime import configure_runtime
         configure_runtime()
@@ -24,17 +28,17 @@ class YoloDetector:
             from ultralytics import YOLO
         except ImportError as exc:
             raise RuntimeError("Install project dependencies with 'uv sync --python 3.10' to use --weights") from exc
-        if image_size < 32 or image_size % 32:
-            raise ValueError("imgsz must be a positive multiple of 32")
         from .model_artifacts import (read_engine_metadata, read_onnx_metadata, validate_source,
                                       validate_engine, runtime_info, file_sha256)
         source_hash = file_sha256(path)
         selected = path
         artifact_metadata = None
         if backend == "tensorrt":
-            selected = Path(engine or path.with_name(f"{path.stem}.{image_size}.fp16.engine"))
+            batch_label = "" if batch_size == 1 else f".b{batch_size}"
+            selected = Path(engine or path.with_name(
+                f"{path.stem}.{size_label(image_size)}{batch_label}.fp16.engine"))
             artifact_metadata = read_engine_metadata(selected)
-            validate_engine(artifact_metadata, source_hash, image_size, runtime_info(device))
+            validate_engine(artifact_metadata, source_hash, image_size, runtime_info(device), batch_size)
         elif backend == "onnx":
             selected = Path(onnx or path.with_suffix(".onnx"))
             artifact_metadata = read_onnx_metadata(selected)
@@ -42,7 +46,7 @@ class YoloDetector:
         elif backend != "pt":
             raise ValueError("backend must be pt, onnx or tensorrt")
         import torch
-        self.torch, self.device, self.profile = torch, device, profile
+        self.torch, self.device, self.profile, self.batch_size = torch, device, profile, batch_size
         self.last_timing = {}
         self.model = YOLO(str(selected), task="detect")
         self.model.overrides.update(device=device, imgsz=image_size, rect=False)
@@ -60,7 +64,7 @@ class YoloDetector:
                              artifact_sha256=file_sha256(selected),
                              backend=backend, torch=torch.__version__, cuda=torch.version.cuda,
                              names=names, ultralytics=ultralytics.__version__, profile=profile,
-                             **self.options)
+                             batch_size=batch_size, **self.options)
 
     def synchronize(self):
         if self.device != "cpu" and self.torch.cuda.is_available():
@@ -68,24 +72,23 @@ class YoloDetector:
             self.torch.cuda.synchronize(device)
 
     def warmup(self, frame, count):
+        if self.batch_size != 1:
+            raise ValueError("batch detector 必须使用 warmup_batch")
         for _ in range(count):
             self.detect(frame)
         self.synchronize()
         self.last_timing = {}
 
-    def detect(self, frame):
-        if self.profile == "diagnostic":
-            self.synchronize()
-        started = time.perf_counter()
-        result = self.model.predict(frame, **self.options)[0]
-        runtime = self.model.predictor.model
-        self.metadata["actual_device"] = str(runtime.device)
-        self.metadata["actual_format"] = runtime.format
-        if hasattr(runtime, "session"):
-            self.metadata["onnx_providers"] = runtime.session.get_providers()
-        if self.profile == "diagnostic":
-            self.synchronize()
-        transfer_started = time.perf_counter()
+    def warmup_batch(self, frames, count):
+        if len(frames) != self.batch_size:
+            raise ValueError(f"预热输入数量必须等于固定 batch={self.batch_size}")
+        for _ in range(count):
+            self.detect_batch(frames)
+        self.synchronize()
+        self.last_timing = {}
+
+    @staticmethod
+    def _detections(result, frame):
         detections = []
         values = [] if result.boxes is None else result.boxes.data.cpu().tolist()
         for x1, y1, x2, y2, confidence, class_id in values:
@@ -98,28 +101,70 @@ class YoloDetector:
             except ValueError:
                 continue
             detections.append(dict(bbox=list(box), confidence=confidence, class_id=int(class_id)))
+        return detections
+
+    def detect_batch(self, frames):
+        if len(frames) != self.batch_size:
+            raise ValueError(f"输入数量必须等于固定 batch={self.batch_size}")
+        if any(not isinstance(frame, np.ndarray) or frame.ndim != 3 for frame in frames):
+            raise ValueError("batch 中每个输入都必须是 HWC 图像")
+        if self.profile == "diagnostic":
+            self.synchronize()
+        started = time.perf_counter()
+        source = frames[0] if self.batch_size == 1 else list(frames)
+        results = self.model.predict(source, **self.options)
+        if len(results) != self.batch_size:
+            raise RuntimeError(f"模型结果数量与 batch 不一致：{len(results)} != {self.batch_size}")
+        runtime = self.model.predictor.model
+        self.metadata["actual_device"] = str(runtime.device)
+        self.metadata["actual_format"] = runtime.format
+        if hasattr(runtime, "session"):
+            self.metadata["onnx_providers"] = runtime.session.get_providers()
+        if self.profile == "diagnostic":
+            self.synchronize()
+        transfer_started = time.perf_counter()
+        detections = [self._detections(result, frame) for result, frame in zip(results, frames)]
         finished = time.perf_counter()
-        self.last_timing = {f"{k}_ms": float(result.speed[k]) for k in
-                            ("preprocess", "inference", "postprocess")}
+        self.last_timing = {f"{k}_ms": float(np.mean([result.speed[k] for result in results]))
+                            for k in ("preprocess", "inference", "postprocess")}
         self.last_timing["result_transfer_ms"] = (finished-transfer_started)*1000
         self.last_timing["detector_ms"] = (finished-started)*1000
         self.last_timing["detector_overhead_ms"] = max(0., self.last_timing["detector_ms"] - sum(
-            self.last_timing[k] for k in ("preprocess_ms", "inference_ms", "postprocess_ms", "result_transfer_ms")))
+            self.last_timing[k]*self.batch_size for k in
+            ("preprocess_ms", "inference_ms", "postprocess_ms")) - self.last_timing["result_transfer_ms"])
         return detections
+
+    def detect(self, frame):
+        if self.batch_size != 1:
+            raise ValueError("batch detector 必须使用 detect_batch")
+        return self.detect_batch([frame])[0]
 
 
 class DetectionTracker:
-    def __init__(self, detector, config=None, interval=1, strict_motion_gate=False):
+    def __init__(self, detector, config=None, interval=1, strict_motion_gate=False,
+                 continuous=False):
         if not isinstance(interval, int) or interval < 1:
             raise ValueError("detect-interval must be a positive integer")
         self.detector, self.config, self.interval = detector, config or Config(), interval
         self.strict_motion_gate = strict_motion_gate
+        self.continuous = continuous
         self.motion = None
         self.segment = 0
+        self.segments = []
+        self._active_segment = None
         self.class_id = None
         self.last_detection_index = None
         self.last_time = None
+        self.last_visible_time = None
+        self.last_box = None
         self.velocity_ready = False
+
+    def finish_segment(self, frame_index, timestamp, reason):
+        """Record closure separately from the last accepted image observation."""
+        if self._active_segment is not None:
+            self._active_segment.update(end_frame=frame_index, end_timestamp=timestamp,
+                                        end_reason=reason)
+            self._active_segment = None
 
     def _record(self, timestamp, frame_index, timestamp_source):
         return dict(frame_index=frame_index, timestamp=timestamp,
@@ -134,6 +179,8 @@ class DetectionTracker:
         result.update(estimated_center=None, detection_ran=False, detections=[],
                       detection_confidence=None, class_id=self.class_id,
                       seconds_since_observation=None)
+        if self.continuous and self.motion is None:
+            result["segment"] = None
         return result
 
     def update(self, frame, timestamp, frame_index, timestamp_source):
@@ -144,10 +191,15 @@ class DetectionTracker:
             gap = timestamp - self.last_visible_time
             result["seconds_since_observation"] = gap
             if gap > self.config.coast_seconds:
+                self.finish_segment(frame_index, timestamp, "tracking_timeout")
                 self.motion = None
                 self.velocity_ready = False
                 self.last_detection_index = None
                 self.last_visible_time = None
+                self.last_box = None
+                if self.continuous:
+                    # Explicit --class-id filtering remains in the detector.
+                    self.class_id = None
                 self.last_time = timestamp
                 result.update(state="LOST", reason="tracking_timeout")
                 return result
@@ -155,7 +207,9 @@ class DetectionTracker:
             result.update(predicted_center=prediction.tolist(), estimated_center=prediction.tolist(),
                           innovation_covariance=self.motion.innovation(prediction)[1].tolist())
         self.last_time = timestamp
-        due = self.last_detection_index is None or frame_index-self.last_detection_index >= self.interval
+        due = ((self.continuous and self.motion is None)
+               or self.last_detection_index is None
+               or frame_index-self.last_detection_index >= self.interval)
         if not due:
             result.update(state="PREDICTED" if self.motion is not None else "WAITING",
                           reason="detection_skipped")
@@ -195,6 +249,11 @@ class DetectionTracker:
         if first:
             self.motion = MotionFilter(center, self.config)
             self.segment += 1
+            self._active_segment = dict(
+                segment=self.segment, class_id=detection["class_id"],
+                start_frame=frame_index, start_timestamp=timestamp,
+                observed_frames=0, end_frame=None, end_timestamp=None, end_reason=None)
+            self.segments.append(self._active_segment)
         elif not self.velocity_ready:
             # Infer velocity at the second observation under the same drag model.
             # A zero-velocity prior cannot gate an already-moving object.
@@ -216,6 +275,9 @@ class DetectionTracker:
         self.class_id = detection["class_id"]
         self.last_visible_time = timestamp
         self.last_box = box
+        self._active_segment["observed_frames"] += 1
+        self._active_segment.update(last_observed_frame=frame_index,
+                                    last_observed_timestamp=timestamp)
         reason = ("detected_initialization" if self.segment == 1 else "detected_reinitialization") if first else (
             "detected_motion_disagreement" if d2 is not None and d2 > self.config.gate else "detected")
         result.update(state="TRACKING", source="yolo", reason=reason,
