@@ -3,8 +3,9 @@ import math
 
 import numpy as np
 
-from tracking.app import VideoClock, config_for_frame, parser
+from tracking.app import config_for_frame, parser
 from tracking.core import Config, MotionFilter
+from tracking.timestamps import VideoClock
 
 
 class MotionTests(unittest.TestCase):

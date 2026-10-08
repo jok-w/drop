@@ -5,7 +5,7 @@ import numpy as np
 
 from tracking.core import Config
 from tracking.detection import DetectionTracker
-from tracking.app import csv_row
+from tracking.result_io import csv_row
 
 
 def detection(x=40, confidence=.8, class_id=0):
@@ -94,6 +94,14 @@ class DetectionTests(unittest.TestCase):
         tracker.update(self.frame, 0., 0, "test")
         with self.assertRaises(ValueError):
             tracker.update(self.frame, 0., 1, "test")
+
+    def test_injected_detections_do_not_require_bound_detector(self):
+        tracker = DetectionTracker(None)
+        result = tracker.update(self.frame, 0., 0, "test", detections=[detection()])
+        self.assertEqual(result["state"], "TRACKING")
+        self.assertTrue(result["detection_ran"])
+        with self.assertRaisesRegex(RuntimeError, "没有绑定检测器"):
+            DetectionTracker(None).update(self.frame, 0., 0, "test")
 
     def test_two_observations_initialize_fast_motion_without_zero_speed_gate(self):
         tracker = DetectionTracker(FakeDetector([[detection(20)], [detection(80)], [detection(140)]]))

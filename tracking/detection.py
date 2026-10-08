@@ -9,6 +9,9 @@ from .image_size import DEFAULT_IMAGE_SIZE, canonical_size, size_label
 from .core import Config, MotionFilter, center_of, validate_box
 
 
+_AUTO_DETECTIONS = object()
+
+
 class YoloDetector:
     def __init__(self, weights, confidence=.25, image_size=DEFAULT_IMAGE_SIZE, device="cpu", class_id=None, iou=.5,
                  backend="pt", engine=None, onnx=None, profile="throughput", batch_size=1):
@@ -183,7 +186,14 @@ class DetectionTracker:
             result["segment"] = None
         return result
 
-    def update(self, frame, timestamp, frame_index, timestamp_source):
+    def update(self, frame, timestamp, frame_index, timestamp_source,
+               detections=_AUTO_DETECTIONS):
+        """Advance one frame.
+
+        By default the tracker invokes its detector for frames on which detection
+        is due. A caller that owns batching can inject that frame's detections,
+        keeping association independent from inference scheduling.
+        """
         if self.last_time is not None and timestamp <= self.last_time:
             raise ValueError("Frame timestamps must increase")
         result = self._result(timestamp, frame_index, timestamp_source)
@@ -215,7 +225,14 @@ class DetectionTracker:
                           reason="detection_skipped")
             return result
         self.last_detection_index = frame_index
-        detections = self.detector.detect(frame)
+        if detections is _AUTO_DETECTIONS:
+            if self.detector is None:
+                raise RuntimeError("未提供检测结果，且跟踪器没有绑定检测器")
+            detections = self.detector.detect(frame)
+        elif detections is None or isinstance(detections, (str, bytes)):
+            raise ValueError("detections 必须是当前帧的检测结果序列")
+        else:
+            detections = list(detections)
         result.update(detection_ran=True, detections=detections)
         candidates = []
         for detection in detections:

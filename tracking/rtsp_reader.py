@@ -70,7 +70,7 @@ class JournalTail:
 
 
 class Worker:
-    def __init__(self, camera, folder, args):
+    def __init__(self, camera, folder, config):
         self.folder = folder
         folder.mkdir()
         self.control = self.shared = self.memory = self.process = self.log = None
@@ -81,17 +81,17 @@ class Worker:
             self.control, child = socket.socketpair()
             self.control.settimeout(2)
             read_fd, write_fd = os.pipe()
-            config = dict(camera.public(), user=camera.user, password=camera.password,
-                          folder=str(folder), mode=args.policy, decode_width=args.decode_width,
-                          segment_seconds=args.segment_seconds,
-                          min_free_bytes=int(args.min_free_mb*1024*1024), memory_bytes=3840*2160*4)
-            command = [args.gst_python, "-I", str(Path(__file__).with_name("gst_camera_worker.py")),
+            worker_config = dict(camera.public(), user=camera.user, password=camera.password,
+                          folder=str(folder), mode=config.policy, decode_width=config.decode_width,
+                          segment_seconds=config.segment_seconds,
+                          min_free_bytes=int(config.min_free_mb*1024*1024), memory_bytes=3840*2160*4)
+            command = [config.gst_python, "-I", str(Path(__file__).with_name("gst_camera_worker.py")),
                        "--config-fd", str(read_fd), "--control-fd", str(child.fileno())]
             fds = [read_fd, child.fileno()]
-            if args.policy == "latest":
+            if config.policy == "latest":
                 self.memory = tempfile.TemporaryFile(dir="/dev/shm")
-                self.memory.truncate(config["memory_bytes"])
-                self.shared = mmap.mmap(self.memory.fileno(), config["memory_bytes"])
+                self.memory.truncate(worker_config["memory_bytes"])
+                self.shared = mmap.mmap(self.memory.fileno(), worker_config["memory_bytes"])
                 command += ["--memory-fd", str(self.memory.fileno())]
                 fds.append(self.memory.fileno())
             self.log = (folder / "worker.log").open("wb")
@@ -103,7 +103,7 @@ class Worker:
             child = None
             with os.fdopen(write_fd, "w") as stream:
                 write_fd = None
-                json.dump(config, stream)
+                json.dump(worker_config, stream)
         except BaseException:
             if child is not None:
                 child.close()
@@ -154,8 +154,8 @@ class Worker:
 
 
 class CameraIngest:
-    def __init__(self, camera, folder, args):
-        self.camera, self.folder, self.args = camera, folder, args
+    def __init__(self, camera, folder, config):
+        self.camera, self.folder, self.config = camera, folder, config
         self.store = SegmentStore(folder / "fragments.sqlite3")
         self.frames = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
@@ -178,11 +178,11 @@ class CameraIngest:
         worker = None
         try:
             while not self.stop_event.is_set():
-                if self.args.seconds and time.monotonic()-started >= self.args.seconds:
+                if self.config.seconds and time.monotonic()-started >= self.config.seconds:
                     break
                 self.sessions += 1
                 session = f"session_{self.sessions:05d}"
-                worker = Worker(self.camera, self.folder / session, self.args)
+                worker = Worker(self.camera, self.folder / session, self.config)
                 opened, source_size = {}, None
                 stop_sent = False
                 stop_at = None
@@ -217,7 +217,7 @@ class CameraIngest:
                             fatal = True
 
                 while worker.process.poll() is None:
-                    expired = self.args.seconds and time.monotonic()-started >= self.args.seconds
+                    expired = self.config.seconds and time.monotonic()-started >= self.config.seconds
                     if (self.stop_event.is_set() or expired or fatal) and not stop_sent:
                         worker.request_stop()
                         stop_sent, stop_at = True, time.monotonic()
@@ -226,7 +226,7 @@ class CameraIngest:
                         self.failure = "camera_finalize_timeout"
                         break
                     poll_events()
-                    if self.args.policy == "latest" and not stop_sent:
+                    if self.config.policy == "latest" and not stop_sent:
                         try:
                             item = worker.frame()
                         except (OSError, RuntimeError):
@@ -250,11 +250,13 @@ class CameraIngest:
                                                  monotonic=time.monotonic(), unclosed_files=list(opened),
                                                  exit_code=worker.process.returncode))+"\n")
                 worker = None
-                if self.stop_event.is_set() or fatal or (self.args.seconds and time.monotonic()-started >= self.args.seconds):
+                if (self.stop_event.is_set() or fatal or
+                        (self.config.seconds and time.monotonic()-started >= self.config.seconds)):
                     break
                 self.reconnects += 1
                 self.events.write(json.dumps(dict(event="reconnecting", delay_seconds=delay))+"\n")
-                remaining = self.args.seconds-(time.monotonic()-started) if self.args.seconds else delay
+                remaining = (self.config.seconds-(time.monotonic()-started)
+                             if self.config.seconds else delay)
                 self.stop_event.wait(max(0, min(delay, remaining)))
                 # A valid stream alone is not proof of a stable connection.
                 delay = min(30., delay*2) if not healthy else 1.
@@ -280,9 +282,9 @@ class CameraIngest:
             raise RuntimeError("摄像机接收线程未结束")
 
 
-def open_fragment(item, args):
+def open_fragment(item, config):
     from .video_reader import create_video_capture
-    return create_video_capture(Path(item["path"]), "gstreamer", 2, args.gst_python, 2)
+    return create_video_capture(Path(item["path"]), "gstreamer", 2, config.gst_python, 2)
 
 
 class ArchiveReplay:

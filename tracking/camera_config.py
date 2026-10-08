@@ -42,3 +42,41 @@ class CameraConfig:
                     else os.environ.get("HIKVISION_PASSWORD", ""))
         return cls(args.host, args.user, password, args.rtsp_port, args.channel,
                    args.stream, args.latency_ms, args.timeout)
+
+
+@dataclass(frozen=True, slots=True)
+class IngestConfig:
+    """Capture policy without any dependency on argparse."""
+
+    policy: str = "complete"
+    seconds: float | None = None
+    segment_seconds: float = 5.0
+    min_free_mb: float = 512.0
+    decode_width: int = 0
+    gst_python: str = "/usr/bin/python3"
+
+    def __post_init__(self):
+        if self.policy not in ("complete", "latest"):
+            raise ValueError("未知摄像机处理策略")
+        for name in ("segment_seconds", "min_free_mb"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} 必须为有限正数")
+        if self.seconds is not None and (not math.isfinite(self.seconds) or self.seconds <= 0):
+            raise ValueError("seconds 必须为有限正数")
+        if self.decode_width < 0:
+            raise ValueError("缩放宽度不能为负数")
+        if self.decode_width and (
+                self.policy != "latest" or self.decode_width < 2 or self.decode_width % 2):
+            raise ValueError("decode-width 仅用于 latest，必须为正偶数")
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            policy=args.policy,
+            seconds=args.seconds,
+            segment_seconds=args.segment_seconds,
+            min_free_mb=args.min_free_mb,
+            decode_width=args.decode_width,
+            gst_python=args.gst_python,
+        )

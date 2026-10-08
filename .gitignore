@@ -4,5 +4,7 @@ outputs/
 test_artifacts/
 *.pyc
 *.onnx
+*.engine
+models/archive/
 .venv-jetson/
 *.mp4

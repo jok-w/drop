@@ -6,6 +6,20 @@
 
 网络摄像机使用入口 `track_camera.py`，支持海康 RTSP/TCP、原始码流分段录像、完整分析与显式低延迟策略。`track_camera_batch.py` 可将一台摄像机的每张实时画面复制为 2/4/6/8 个逻辑摄像机输入，用固定 TensorRT batch 测试多路识别吞吐；它不模拟多路 RTSP/NVDEC。连接配置、静态检查、录像重放和当前验证范围见 [CAMERA_USAGE.md](CAMERA_USAGE.md)。
 
+识别核心已与命令行、RTSP和文件输出解耦。外部系统可使用
+`tracking.recognition.FramePacket`、`TrackingConfig` 和 `RecognitionEngine` 直接提交固定 batch；
+`process_batch()` 返回按 `camera_id` 对应的结果，每个摄像机维护独立跟踪状态。模型应先调用
+`warmup()`，完成后再启动外部采集。CSV/JSON只是可选的 `ResultSink`，不是核心接口。
+
+```python
+from tracking.recognition import FramePacket, RecognitionEngine, TrackingConfig
+
+engine = RecognitionEngine(detector, TrackingConfig())
+engine.warmup((640, 640, 3), count=5)
+results = engine.process_batch(frame_packets)  # 数量必须匹配固定 TensorRT batch
+engine.finish("system_stop")
+```
+
 在目标 Jetson（JetPack 6、Python 3.10）上安装并运行：
 
 ```bash

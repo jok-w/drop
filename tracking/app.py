@@ -10,35 +10,13 @@ import time
 import cv2
 import numpy as np
 
-from .core import Config
 from .image_size import DEFAULT_IMAGE_SIZE
+from .recognition import TrackingConfig
+from .result_io import FIELDS, csv_row
+from .timestamps import VideoClock
 
 
 WINDOW = "Single target | SPACE play/pause | N next | Q quit"
-FIELDS = ["frame_index", "timestamp", "timestamp_source", "segment", "state", "source",
-          "reason", "x", "y", "width", "height", "center_x", "center_y",
-          "predicted_x", "predicted_y", "mahalanobis_squared", "candidate_bbox"]
-FIELDS += ["estimated_x", "estimated_y", "detection_ran", "detection_confidence",
-           "class_id", "seconds_since_observation"]
-
-
-class VideoClock:
-    def __init__(self, fps):
-        self.fps = fps
-        self.previous = None
-
-    def get(self, milliseconds, index):
-        value = milliseconds / 1000.0
-        valid = math.isfinite(value) and value >= 0
-        valid = valid and (self.previous is None or value > self.previous)
-        valid = valid and not (index > 0 and value == 0)
-        source = "video_timestamp" if valid else "fps_fallback"
-        if not valid:
-            value = index / self.fps if self.previous is None else self.previous + 1 / self.fps
-        self.previous = value
-        return value, source
-
-
 def draw(frame, result, history, estimated_history=()):
     canvas = frame.copy()
     estimates = list(estimated_history) + [(result.get("estimated_center"), result["segment"])]
@@ -102,32 +80,8 @@ def draw_output(frame, result, history, estimated_history, size):
                 [(point(p), segment) for p, segment in estimated_history])
 
 
-def csv_row(result):
-    row = {key: result.get(key) for key in FIELDS}
-    for key, value in zip(["x", "y", "width", "height"], result["bbox"] or [None] * 4):
-        row[key] = value
-    for key, value in zip(["center_x", "center_y"], result["center"] or [None] * 2):
-        row[key] = value
-    for key, value in zip(["predicted_x", "predicted_y"], result["predicted_center"] or [None] * 2):
-        row[key] = value
-    row["candidate_bbox"] = json.dumps(result["candidate_bbox"]) if result["candidate_bbox"] else ""
-    for key, value in zip(["estimated_x", "estimated_y"], result.get("estimated_center") or [None] * 2):
-        row[key] = value
-    return row
-
-
 def config_for_frame(args, shape):
-    # Default noise parameters describe a <=1280px-long-edge image. In 4K,
-    # identical fractional motion spans three times as many pixels.
-    scale = max(1.0, max(shape[:2]) / 1280.0)
-    return Config(
-        gate=args.gate,
-        measurement_std=args.measurement_std if args.measurement_std is not None else 4.0 * scale,
-        acceleration_std=args.acceleration_std if args.acceleration_std is not None else 800.0 * scale,
-        deceleration_rate=args.deceleration_rate,
-        initial_velocity_std=args.initial_velocity_std if args.initial_velocity_std is not None else 200.0 * scale,
-        coast_seconds=args.coast_seconds,
-    )
+    return TrackingConfig.from_args(args).for_source((shape[1], shape[0]))
 
 
 def run(args):

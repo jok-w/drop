@@ -8,8 +8,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-from tracking.camera_app import CameraTracker, SourceCoordinateDetector, parser, run, validate
-from tracking.camera_config import CameraConfig
+from tracking.camera_app import parser, run, validate
+from tracking.camera_config import CameraConfig, IngestConfig
+from tracking.recognition import FramePacket, StreamTracker, TrackingConfig, scale_detections
 from tracking.rtsp_reader import ArchiveReplay, CameraIngest, JournalTail, SegmentStore
 
 
@@ -51,20 +52,25 @@ class CameraTests(unittest.TestCase):
                 validate(parser().parse_args(values))
 
     def test_scaled_observations_return_to_source_coordinates(self):
-        d = SourceCoordinateDetector(Detector())
-        d.source_size = [3840,2160]
-        result = d.detect(np.zeros((360,640,3),np.uint8))
+        detections = Detector().detect(np.zeros((360,640,3),np.uint8))
+        result = scale_detections(detections, (640, 360), (3840, 2160))
         self.assertEqual(result[0]['bbox'], [60,120,48,72])
+        self.assertEqual(detections[0]['bbox'], [10,20,8,12])
 
     def test_session_change_ends_track_and_uses_fresh_motion_with_unique_id(self):
-        tracker = CameraTracker(Detector(),parser().parse_args([]))
+        tracker = StreamTracker(TrackingConfig.from_args(parser().parse_args([])))
+        detector = Detector()
         frame = np.zeros((120,160,3),np.uint8)
         meta = dict(session_id='a', source_size=[160,120], pts_ns=1_000_000_000,index=0)
-        first = tracker.update(frame,meta,0)
+        packet = lambda values, index: FramePacket.from_meta('camera', frame, index, dict(
+            values, received_monotonic=0.))
+        first = tracker.update(packet(meta, 0), detector.detect(frame))
         self.assertEqual(first['segment'],1)
-        second = tracker.update(frame,dict(meta,index=3,pts_ns=1_120_000_000),1)
+        second_meta = dict(meta,index=3,pts_ns=1_120_000_000)
+        second = tracker.update(packet(second_meta, 1), detector.detect(frame))
         self.assertEqual(second['skipped_before'],2)
-        third = tracker.update(frame,dict(meta,session_id='b',pts_ns=0),2)
+        third_meta = dict(meta,session_id='b',pts_ns=0)
+        third = tracker.update(packet(third_meta, 2), detector.detect(frame))
         self.assertEqual(third['segment'],2)
         self.assertIsNone(third['predicted_center'])
         self.assertEqual(tracker.segments[0]['end_reason'],'stream_disconnect')
@@ -188,7 +194,7 @@ class CameraTests(unittest.TestCase):
                 def close(self):
                     self.returncode=1
 
-            ingest=CameraIngest(CameraConfig(),root,args)
+            ingest=CameraIngest(CameraConfig(),root,IngestConfig.from_args(args))
             with patch('tracking.rtsp_reader.Worker',FakeWorker):
                 ingest.start()
                 self.assertTrue(ingest.finished.wait(4))

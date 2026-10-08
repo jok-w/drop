@@ -1,83 +1,22 @@
 """Network camera tracking with explicit completeness versus latency policies."""
 import argparse
 from collections import Counter
-import csv
 from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
 import queue
-import subprocess
 import time
 
 import cv2
-import numpy as np
 
-from .app import FIELDS, VideoClock, config_for_frame, csv_row
-from .camera_config import CameraConfig
+from .camera_config import CameraConfig, IngestConfig
 from .image_size import DEFAULT_IMAGE_SIZE, image_shape
+from .recognition import FramePacket, RecognitionEngine, TrackingConfig
+from .result_io import ResultSink
 from .rtsp_reader import ArchiveReplay, CameraIngest, open_fragment
-
-
-class SourceCoordinateDetector:
-    def __init__(self, detector):
-        self.detector = detector
-        self.source_size = None
-
-    def detect(self, frame):
-        detections = self.detector.detect(frame)
-        width, height = self.source_size
-        sx, sy = width/frame.shape[1], height/frame.shape[0]
-        for d in detections:
-            x, y, w, h = d["bbox"]
-            left, top = round(x*sx), round(y*sy)
-            right, bottom = min(width, round((x+w)*sx)), min(height, round((y+h)*sy))
-            d["bbox"] = [left, top, right-left, bottom-top]
-        return detections
-
-
-class CameraTracker:
-    """Keep global target numbering but reset filter/time across camera sessions."""
-    def __init__(self, detector, args):
-        self.detector = SourceCoordinateDetector(detector)
-        self.args = args
-        self.tracker = None
-        self.session = self.size = None
-        self.segments = []
-        self.last_index = self.last_stamp = None
-        self.offset = 0
-        self.last_source_index = -1
-
-    def finish(self, reason):
-        if self.tracker is not None:
-            self.tracker.finish_segment(self.last_index, self.last_stamp, reason)
-            self.segments.extend(dict(s, session_id=self.session) for s in self.tracker.segments)
-            self.offset = self.tracker.segment
-            self.tracker = None
-
-    def update(self, frame, meta, index):
-        from .detection import DetectionTracker
-        session, size = meta["session_id"], meta["source_size"]
-        stamp = meta["pts_ns"]/1e9
-        if (self.session != session or self.size != size or
-                (self.last_stamp is not None and stamp <= self.last_stamp)):
-            self.finish("stream_disconnect" if self.session != session else "stream_discontinuity")
-            self.session, self.size = session, size
-            self.last_source_index = -1
-        if self.tracker is None:
-            self.tracker = DetectionTracker(self.detector,
-                config_for_frame(self.args, (size[1], size[0], 3)),
-                interval=1, strict_motion_gate=self.args.strict_motion_gate, continuous=True)
-            self.tracker.segment = self.offset
-        self.detector.source_size = size
-        result = self.tracker.update(frame, stamp, index, "stream_pts")
-        result.update(session_id=session, source_size=size, processing_size=[frame.shape[1], frame.shape[0]],
-                      pts_ns=meta["pts_ns"], source_frame_index=meta["index"],
-                      skipped_before=max(0, meta["index"]-self.last_source_index-1))
-        self.last_source_index = meta["index"]
-        self.last_index, self.last_stamp = index, stamp
-        return result
+from .timestamps import VideoClock
 
 
 def parser():
@@ -120,16 +59,12 @@ def parser():
 
 
 def validate(args):
-    for name in ("segment_seconds", "timeout", "min_free_mb", "coast_seconds"):
-        value = getattr(args, name)
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} 必须为有限正数")
-    if args.seconds is not None and (not math.isfinite(args.seconds) or args.seconds <= 0):
-        raise ValueError("seconds 必须为有限正数")
-    if args.decode_width < 0 or args.warmup < 0 or args.latency_ms < 0:
-        raise ValueError("缩放宽度、预热和缓冲不能为负数")
-    if args.decode_width and (args.policy != "latest" or args.decode_width < 2 or args.decode_width % 2):
-        raise ValueError("decode-width 仅用于 latest，必须为正偶数")
+    IngestConfig.from_args(args)
+    TrackingConfig.from_args(args).for_source((1280, 720))
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise ValueError("timeout 必须为有限正数")
+    if args.warmup < 0 or args.latency_ms < 0:
+        raise ValueError("预热和缓冲不能为负数")
     if args.replay and (args.policy != "complete" or args.seconds is not None):
         raise ValueError("replay 使用 complete 策略，不接受摄像机接收时长 seconds")
 
@@ -138,18 +73,20 @@ def run(args):
     from .detection import YoloDetector
     validate(args)
     camera = CameraConfig.from_args(args) if not args.replay else CameraConfig()
+    ingest_config = IngestConfig.from_args(args)
     output = Path(args.output or Path("outputs") / datetime.now().strftime("camera_%Y%m%d_%H%M%S_%f")).resolve()
     if output.exists():
         raise ValueError("输出目录已存在")
     detector = YoloDetector(args.weights, args.conf, args.imgsz, args.device, args.class_id,
                             args.nms_iou, backend=args.backend)
+    engine = RecognitionEngine(detector, TrackingConfig.from_args(args))
     warmup_height, warmup_width = image_shape(args.imgsz)
     warmup_started = time.monotonic()
-    detector.warmup(np.zeros((warmup_height, warmup_width, 3), dtype=np.uint8), args.warmup)
+    engine.warmup((warmup_height, warmup_width, 3), args.warmup)
     warmup_seconds = time.monotonic()-warmup_started
     output.mkdir(parents=True)
-    ingest = ArchiveReplay(args.replay, output) if args.replay else CameraIngest(camera, output, args)
-    tracker = CameraTracker(detector, args)
+    ingest = (ArchiveReplay(args.replay, output) if args.replay
+              else CameraIngest(camera, output, ingest_config))
     count = calls = skipped = 0
     timing = Counter()
     states = Counter()
@@ -159,28 +96,23 @@ def run(args):
     next_log = started
     source_indices = Counter()
     source_label = f"重放={args.replay}" if args.replay else f"摄像机={camera.url}，TCP"
-    print(f"{source_label}，策略={args.policy}，输出={output}", flush=True)
+    print(f"{source_label}，策略={ingest_config.policy}，输出={output}", flush=True)
 
     try:
-        with (output / "track.jsonl").open("w", buffering=1) as records, \
-                (output / "track.csv").open("w", newline="", encoding="utf-8-sig") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=FIELDS+["session_id", "source_frame_index", "skipped_before"])
-            writer.writeheader()
+        with ResultSink(output, ("session_id", "source_frame_index", "skipped_before")) as sink:
 
             def process(frame, meta):
                 nonlocal count, calls, skipped, next_log
                 detector.last_timing = {}
                 tick = time.monotonic()
-                result = tracker.update(frame, meta, count)
+                packet = FramePacket.from_meta("camera_01", frame, count, meta)
+                result = engine.process_batch([packet])[0]
                 result["result_monotonic"] = time.monotonic()
                 result["frame_ready_to_result_ms"] = (time.monotonic()-meta["received_monotonic"])*1000
                 result["archive_file"] = meta.get("archive_file")
                 result["archive_wait_ms"] = (max(0, tick-meta["closed_monotonic"])*1000
                                              if "closed_monotonic" in meta and not args.replay else None)
-                records.write(json.dumps(result, allow_nan=False)+"\n")
-                row = csv_row(result)
-                row.update({k: result[k] for k in ("session_id", "source_frame_index", "skipped_before")})
-                writer.writerow(row)
+                sink.write(result)
                 count += 1
                 calls += bool(result["detection_ran"])
                 skipped += result["skipped_before"]
@@ -190,22 +122,23 @@ def run(args):
                     timing[k] += v
                 if time.monotonic() >= next_log:
                     backlog = ingest.store.counts().get(0, 0)
-                    queue_text = f"待分析录像段={backlog}" if args.policy == "complete" else f"归档录像段={ingest.archived}"
+                    queue_text = (f"待分析录像段={backlog}" if ingest_config.policy == "complete"
+                                  else f"归档录像段={ingest.archived}")
                     print(f"已分析={count}，检测={calls}，跳帧={skipped}，{queue_text}，重连={ingest.reconnects}", flush=True)
-                    csv_file.flush()
+                    sink.flush()
                     next_log = time.monotonic()+5
 
             try:
                 ingest.start()
                 while True:
-                    if args.policy == "complete":
+                    if ingest_config.policy == "complete":
                         item = ingest.store.next()
                         if item is None:
                             if ingest.finished.is_set() and ingest.store.next() is None:
                                 break
                             time.sleep(.05)
                             continue
-                        cap = open_fragment(item, args)
+                        cap = open_fragment(item, ingest_config)
                         try:
                             clock = VideoClock(cap.get(cv2.CAP_PROP_FPS))
                             local_index = 0
@@ -247,19 +180,21 @@ def run(args):
                     reason = "no_frames"
                 if ingest.failure:
                     reason = "capture_error"
-                tracker.finish(reason)
+                engine.finish(reason)
                 counts = ingest.store.counts()
                 ingest.store.close()
                 summary = dict(camera=None if args.replay else camera.public(), replay=args.replay,
-                               policy=args.policy, frames=count,
+                               policy=ingest_config.policy, frames=count,
                                detection_calls=calls, skipped_before_processed_frames=skipped,
-                               decoded_frames_reported=ingest.decoded_frames if args.policy == "latest" else None,
+                               decoded_frames_reported=(ingest.decoded_frames
+                                                        if ingest_config.policy == "latest" else None),
                                unprocessed_decoded_frames=(max(0, ingest.decoded_frames-count)
-                                   if args.policy == "latest" and ingest.closed_sessions == ingest.sessions else None),
+                                   if ingest_config.policy == "latest"
+                                   and ingest.closed_sessions == ingest.sessions else None),
                                sessions=ingest.sessions,
                                reconnects=ingest.reconnects, archived_fragments=ingest.archived,
                                pending_fragments=counts.get(0, 0), analyzed_fragments=counts.get(1, 0),
-                               states=dict(states), segments=tracker.segments, end_reason=reason,
+                               states=dict(states), segments=engine.segments, end_reason=reason,
                                capture_error=ingest.failure, analysis_error=error,
                                warmup_seconds=warmup_seconds,
                                wall_seconds=time.monotonic()-started, totals=dict(timing),
@@ -292,26 +227,6 @@ def main():
 
 def check(args):
     """Static gate: imports/plugins/artifact shape and hash, no CUDA allocation or camera I/O."""
-    from .image_size import image_shape, size_label
-    from .model_artifacts import read_engine_metadata, file_sha256, validate_source
+    from .camera_checks import static_camera_check
     validate(args)
-    result = subprocess.run([args.gst_python, "-I", str(Path(__file__).with_name("gst_camera_worker.py")),
-                             "--check"], capture_output=True, text=True, timeout=15)
-    if result.returncode:
-        raise RuntimeError("GStreamer/GI 环境检查失败："+result.stderr[-1500:]+result.stdout[-1500:])
-    # Jetson native libraries may write diagnostics before/after the JSON line.
-    payload = next((line for line in result.stdout.splitlines() if line.startswith('{')), None)
-    if payload is None:
-        raise RuntimeError("GStreamer 检查缺少结构化结果")
-    report = dict(gstreamer=json.loads(payload), camera_connection_tested=False,
-                  cuda_inference_tested=False)
-    if args.backend == "tensorrt":
-        weights = Path(args.weights).resolve()
-        engine = weights.with_name(f"{weights.stem}.{size_label(args.imgsz)}.fp16.engine")
-        metadata = read_engine_metadata(engine)
-        tracking = validate_source(metadata, file_sha256(weights))
-        if image_shape(tracking["image_size"]) != image_shape(args.imgsz):
-            raise ValueError("engine 输入尺寸与参数不匹配")
-        report["engine"] = dict(path=str(engine), image_size=tracking["image_size"],
-                                source_fingerprint_valid=True, build_runtime=tracking["runtime"])
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps(static_camera_check(args), ensure_ascii=False, indent=2))

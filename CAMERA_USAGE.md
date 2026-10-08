@@ -53,7 +53,7 @@ UV_PROJECT_ENVIRONMENT=.venv-jetson uv run --no-sync python track_camera.py \
 
 ### 3.1 单摄像机复制 batch 测试
 
-`track_camera_batch.py` 只连接、解码并录像一次，将每张实时 BGR 图像复制成 N 份，作为 N 个逻辑摄像机组成固定 batch。每个逻辑摄像机有独立的 `camera_id`、Kalman 状态和轨迹段；模型只加载、预热和调用一次。该入口仅支持 `latest`，用于测量 batch 推理、逐路跟踪和结果写入，**不代表 N 路 RTSP、NVDEC、网络和录像负载**。
+`track_camera_batch.py` 只连接、解码并录像一次，将同一张实时 BGR 图像引用作为 N 个逻辑摄像机输入组成固定 batch，不再为每个槽位执行整帧 `copy()`。每个逻辑摄像机有独立的 `camera_id`、Kalman 状态和轨迹段；模型只加载、预热和调用一次。该入口仅支持 `latest`，用于测量 batch 推理、逐路跟踪和结果写入，**不代表 N 路 RTSP、NVDEC、网络和录像负载**。
 
 先构建与测试数量完全匹配的 engine：
 
@@ -70,7 +70,7 @@ UV_PROJECT_ENVIRONMENT=.venv-jetson uv run --no-sync python track_camera_batch.p
   --backend tensorrt --device 0 --imgsz 640
 ```
 
-支持 batch 1/2/4/6/8，并自动选择 `models/detect.640.b2.fp16.engine`、`detect.640.b4.fp16.engine`、`detect.640.b6.fp16.engine` 等文件。`summary.json` 同时给出物理源帧数、逻辑帧数、总吞吐、源跳帧和各阶段分位数；`batch_timing.jsonl` 每个 batch 一行；`track.jsonl` 每个逻辑摄像机结果一行。`batch_detector_ms` 是整批耗时，预处理/推理/后处理字段是每张图平均耗时。
+支持 batch 1/2/4/6/8，并自动选择 `models/detect.640.b2.fp16.engine`、`detect.640.b4.fp16.engine`、`detect.640.b6.fp16.engine` 等文件。`summary.json` 同时给出物理源帧数、逻辑帧数、总吞吐、源跳帧和各阶段分位数；`batch_timing.jsonl` 每个 batch 一行；`track.jsonl` 每个逻辑摄像机结果一行。`batch_detector_ms` 是整批耗时，`batch_assembly_ms` 是构造帧契约和逻辑摄像机列表的耗时，预处理/推理/后处理字段是每张图平均耗时。
 
 ## 4. 重新分析已保存录像
 

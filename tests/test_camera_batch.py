@@ -89,7 +89,7 @@ class CameraBatchTests(unittest.TestCase):
             self.assertEqual(result, output)
             detector = FakeBatchDetector.instance
             self.assertEqual(detector.warmups, [(2, [(640, 640, 3), (640, 640, 3)], 3)])
-            self.assertEqual(detector.distinct_inputs, 2)
+            self.assertEqual(detector.distinct_inputs, 1)
             summary = json.loads((output / "summary.json").read_text())
             self.assertEqual(summary["physical_frames"], 1)
             self.assertEqual(summary["logical_frames"], 2)
